@@ -1,0 +1,3506 @@
+---
+title: "final_pipeline"
+author: "Arya Jadhav"
+date: "2025-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(SeuratDisk)
+library(tidyverse)
+library(patchwork) 
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{R, config_reticulate}
+
+
+# Load required libraries
+library(reticulate)
+library(Matrix)
+
+reticulate::virtualenv_create("r-reticulate")
+reticulate::virtualenv_install("r-reticulate", packages = c("numpy", "scipy"))
+reticulate::use_virtualenv("r-reticulate", required = TRUE)
+np <- import("numpy")
+scipy_sparse <- import("scipy.sparse")
+
+# Funtion to convert .npz file to sparse dgRMatrix format in R
+read_npz_into_R <- function(file_path){
+  npz_data <- np$load(file_path)
+  r_data <- new("dgRMatrix", x = as.numeric(npz_data[["data"]]),
+            j = as.integer(npz_data[["indices"]]),
+            p = as.integer(npz_data[["indptr"]]),
+            Dim = as.integer(npz_data[["shape"]])
+            )
+  as(r_data, "CsparseMatrix")
+}
+```
+
+Read in files from NPZ and metadata from tsv into two `dgCMatrix` objects, one for spliced and one for unspliced.
+
+```{R, read_files}
+# Load gene expression data (spliced and unspliced counts) and metadata
+folder <- "/mnt/home/jadharya/gene_files/raw_loom_10x_vc/heart_10k_v3_cr_extracted"
+
+spliced_counts   <- read_npz_into_R(file.path(folder, "heart_10k_v3_cr_spliced.npz"))
+unspliced_counts <- read_npz_into_R(file.path(folder, "heart_10k_v3_cr_unspliced.npz"))
+gene_data <- read.csv(file.path(folder, "heart_10k_v3_cr_genes.tsv"), sep = "\t", header = F)
+cell_data <- read.csv(file.path(folder, "heart_10k_v3_cr_barcodes.tsv"), sep = "\t", header = F)
+
+# Assign column and row names
+colnames(spliced_counts) <- colnames(unspliced_counts) <- as.character(cell_data[,1])
+rownames(spliced_counts) <- paste0(as.character(gene_data[,1]), "_s")
+rownames(unspliced_counts) <- paste0(as.character(gene_data[,1]), "_us")
+
+# Concatenate matrices and identify row indices
+A <- rbind(spliced_counts, unspliced_counts)
+spliced_indices <- 1:nrow(spliced_counts)
+unspliced_indices <- (nrow(spliced_counts) + 1):nrow(A)
+
+# basic QC to filter out low-quality cells
+A <- A[, which(colSums(A != 0) > 200 & colSums(A != 0) < 15000 & colSums(A) > 500 & colSums(A) < 75000)]
+
+# standard log normalization
+A <- Seurat::LogNormalize(A)
+
+
+# Store raw gene names for future use (e.g., merging)
+gene_names <- as.character(gene_data[,1])
+rownames(spliced_counts) <- rownames(unspliced_counts) <- gene_names
+
+# Create the added (summed) version
+combined_counts <- spliced_counts + unspliced_counts
+
+# Apply same QC as to A
+# Retain only cells with sufficient counts
+combined_counts <- combined_counts[, which(
+  colSums(combined_counts != 0) > 200 & 
+  colSums(combined_counts != 0) < 15000 &
+  colSums(combined_counts) > 500 & 
+  colSums(combined_counts) < 75000
+)]
+
+# Apply normalization on combined matrix
+combined_counts <- Seurat::LogNormalize(combined_counts)
+
+
+```
+
+```{r}
+# Save processed matrices and index vectors for reuse
+save(
+  A,
+  spliced_indices,
+  unspliced_indices,
+  combined_counts,
+  file = "heart_log_normalized_data.RData"
+)
+
+```
+
+```{r}
+
+load("heart_log_normalized_data.RData")
+
+```
+
+# Cross-validation of data
+
+```{r}
+# devtools::install_github("zdebruine/singlet")
+library(singlet)
+
+# Function for performing NMF cross-validation over a range of ranks
+cross_val <- function(A, ranks = 2:80){
+  cv_data <- singlet::cross_validate_nmf(A, ranks,
+                                         n_replicates = 3,
+                                         trace_test_mse = 1,
+                                         maxit = 50, tol = -1, tol_overfit = Inf)
+  cv_data <- aggregate(cv_data$test_error, by = list(cv_data$k, cv_data$iter), FUN = mean)
+  colnames(cv_data) <- c("k", "iter", "test_err")
+  return(cv_data)
+}
+
+# Function to determine best rank by minimizing test error at final iteration
+get_best_rank <- function(cv_data){
+  cv_data %>%
+    group_by(k) %>%
+    summarise(mean_final_test_err = mean(test_err[iter == max(iter)]), .groups = "drop") %>%
+    arrange(mean_final_test_err) %>%
+    slice(1) %>%
+    pull(k)
+}
+
+```
+
+```{r}
+# Run cross-validation for all modalities (concatenated, spliced-only, unspliced-only, added)
+set.seed(43)
+cv_results_concat <- cross_val(A, ranks = 2:80)
+best_rank_concat <- get_best_rank(cv_results_concat)
+cv_results_spliced <- cross_val(A[spliced_indices, ], ranks = 2:80)
+best_rank_spliced <- get_best_rank(cv_results_spliced)
+cv_results_unspliced <- cross_val(A[unspliced_indices, ], ranks = 2:80)
+best_rank_unspliced <- get_best_rank(cv_results_unspliced)
+cv_results_added <- cross_val(combined_counts, ranks = 2:80)
+best_rank_added <- get_best_rank(cv_results_added)
+
+```
+
+
+```{r}
+
+# Save all cross-validation results for later use
+save(
+  A,
+  cv_results_spliced,
+  best_rank_spliced,
+  cv_results_unspliced,
+  best_rank_unspliced,
+  cv_results_added,
+  best_rank_added,
+  cv_results_concat,
+  best_rank_concat,
+  file = "heart_nmf_cv_results.RData"
+)
+
+
+```
+
+```{r}
+
+load("heart_nmf_cv_results.RData")
+# Output best ranks selected for each modality
+best_rank_concat
+best_rank_spliced
+best_rank_unspliced
+best_rank_added
+
+```
+
+Replicate CV runs with different seeds
+
+```{r}
+# Run cross-validation again with different seeds to assess stability
+set.seed(44)
+cv_results_concat2 <- cross_val(A, ranks = 2:80)
+best_rank_concat2 <- get_best_rank(cv_results_concat2)
+cv_results_spliced2 <- cross_val(A[spliced_indices, ], ranks = 2:80)
+best_rank_spliced2 <- get_best_rank(cv_results_spliced2)
+cv_results_unspliced2 <- cross_val(A[unspliced_indices, ], ranks = 2:80)
+best_rank_unspliced2 <- get_best_rank(cv_results_unspliced2)
+cv_results_added2 <- cross_val(combined_counts, ranks = 2:80)
+best_rank_added2 <- get_best_rank(cv_results_added)
+
+```
+
+
+```{r}
+# Save second set of CV results
+save(
+  cv_results_spliced2,
+  best_rank_spliced2,
+  cv_results_unspliced2,
+  best_rank_unspliced2,
+  cv_results_concat2,
+  best_rank_concat2,
+  cv_results_added2,
+  best_rank_added2,
+  file = "heart_nmf_cv_results2.RData"
+)
+
+```
+
+```{r}
+load("heart_nmf_cv_results2.RData")
+```
+
+```{r}
+# Run third round of cross-validation for robustness
+set.seed(45)
+cv_results_concat3 <- cross_val(A, ranks = 2:80)
+best_rank_concat3 <- get_best_rank(cv_results_concat3)
+cv_results_spliced3 <- cross_val(A[spliced_indices, ], ranks = 2:80)
+best_rank_spliced3 <- get_best_rank(cv_results_spliced3)
+cv_results_unspliced3 <- cross_val(A[unspliced_indices, ], ranks = 2:80)
+best_rank_unspliced3 <- get_best_rank(cv_results_unspliced3)
+cv_results_added3 <- cross_val(combined_counts, ranks = 2:80)
+best_rank_added3 <- get_best_rank(cv_results_added3)
+
+```
+
+```{r}
+# Save third set of CV results
+save(
+  cv_results_spliced3,
+  best_rank_spliced3,
+  cv_results_unspliced3,
+  best_rank_unspliced3,
+  cv_results_concat3,
+  best_rank_concat3,
+  cv_results_added3,
+  best_rank_added3,
+  file = "heart_nmf_cv_results3.RData"
+)
+
+```
+
+```{r}
+load("heart_nmf_cv_results3.RData")
+```
+
+```{r}
+# Combine all 3 replicate results into lists for grouped analysis
+h_concat_cv <- list(cv_results_concat, cv_results_concat2, cv_results_concat3)
+h_spliced_cv  <- list(cv_results_spliced, cv_results_spliced2, cv_results_spliced3)
+h_unspliced_cv <- list(cv_results_unspliced, cv_results_unspliced2, cv_results_unspliced3)
+h_added_cv <- list(cv_results_added,cv_results_added2, cv_results_added3)
+
+```
+
+```{r}
+# Save grouped CV data
+save(
+  h_concat_cv, h_spliced_cv, h_unspliced_cv,h_added_cv,
+  file = "heart_rank_sweep_results.RData"
+)
+
+```
+
+```{r}
+load("heart_rank_sweep_results.RData")
+
+```
+
+## CV figure by seeds
+```{r}
+
+label_cv_df <- function(cv_list, source_label) {
+  dplyr::bind_rows(lapply(seq_along(cv_list), function(i) {
+    df <- cv_list[[i]]
+    df$replicate <- i
+    df$source <- source_label
+    return(df)
+  }))
+}
+
+# Label and combine CV results
+h_cv_concat_all <- label_cv_df(h_concat_cv, "Concat") %>% mutate(seed = replicate)
+h_cv_spliced_all  <- label_cv_df(h_spliced_cv, "Spliced") %>% mutate(seed = replicate)
+h_cv_unspliced_all <- label_cv_df(h_unspliced_cv, "Unspliced") %>% mutate(seed = replicate)
+h_cv_added_all <- label_cv_df(h_added_cv, "Added") %>% mutate(seed = replicate)
+
+# Combine all into one data frame
+h_cv_all <- bind_rows(h_cv_concat_all, h_cv_spliced_all, h_cv_unspliced_all,h_cv_added_all)
+
+# Order factor levels for consistent plotting
+h_cv_all$source <- factor(h_cv_all$source, levels = c("Concat", "Spliced", "Unspliced", "Added"))
+
+# Summary statistics per seed, source, and rank
+h_cv_all_summary <- h_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(
+    mean_err = mean(test_err),
+    sd_err = sd(test_err),
+    .groups = "drop"
+  )
+
+# Best k per seed and source
+h_best_k_by_seed <- h_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(mean_err = mean(test_err), .groups = "drop") %>%
+  group_by(seed, source) %>%
+  slice_min(mean_err, n = 1) %>%
+  rename(best_k = k)
+```
+
+
+```{r}
+# Plot
+#This plot shows the mean test error ± standard deviation across different ranks (k) for each modality (Concat, Spliced, Unspliced, Added) across 3 random seeds.
+
+fig3 <- ggplot(h_cv_all_summary, aes(x = k, y = mean_err, color = source, fill = source)) +
+  geom_line(size = 1) +
+  geom_vline(data = h_best_k_by_seed, aes(xintercept = best_k), linetype = "dashed", color = "black") +
+  geom_text(
+    data = h_best_k_by_seed,
+    aes(x = best_k, y = Inf, label = paste0("k=", best_k)),
+    vjust = -0.5, hjust = 0, angle = 90, size = 3, color = "black", inherit.aes = FALSE
+  ) +
+  #geom_ribbon(aes(ymin = mean_err - sd_err, ymax = mean_err + sd_err), alpha = 0.2, color = NA) +
+  facet_grid(seed ~ source, scales = "fixed") +
+  labs(
+    title = "Heart NMF CV Error by Rank and Seed",
+    subtitle = "Mean ± SD for each modality and seed",
+    x = "Rank (k)", y = "Test Error"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+ggsave("new_cv_error_byseed_heart.png", plot = fig3, width = 12.5, height = 5.5, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+```{r}
+h_cv_all <- h_cv_all %>% rename(epoch = iter)
+
+
+panel_a <- ggplot(h_cv_all, aes(x = k, y = test_err, group = epoch, color = epoch)) +
+  geom_line(size = 0.3, alpha = 0.9) +
+  facet_grid(seed ~ source) +
+  scale_color_viridis_c(name = "Epoch", direction = -1) +
+  labs(
+    x = "NMF Model Rank",
+    y = "Test Set Loss",
+    title = "A"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+selected_ranks <- c(5, 30, 80)
+rank_labels <- c("5" = "Underfit (k = 5)", "30" = "Better Fit (k = 30)", "80" = "Overfit (k = 80)")
+
+h_cv_subset <- h_cv_all %>% filter(k %in% selected_ranks)
+
+panel_b <- ggplot(h_cv_subset, aes(x = epoch, y = test_err, color = factor(k))) +
+  geom_line(size = 1) +
+  facet_grid(seed ~ source) +
+  scale_color_manual(
+    name = "Rank",
+    values = c("5" = "black", "30" = "red", "80" = "gold"),
+    labels = rank_labels
+  ) +
+  labs(
+    x = "NMF Model Epoch",
+    y = "Test Set Loss",
+    title = "B"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+library(cowplot)
+
+# plot to show Test error over epochs for all ranks
+
+final_cv_figure <- plot_grid(panel_a, panel_b, ncol = 1, labels = NULL, rel_heights = c(1.2, 1))
+final_cv_figure_titled <- plot_grid(
+  ggdraw() + 
+    draw_label("CV Error Trajectories by Epoch and Rank for Heart Dataset", 
+               fontface = 'bold', 
+               x = 0.5, 
+               hjust = 0.5, 
+               size = 16), 
+  final_cv_figure, 
+  ncol = 1, 
+  rel_heights = c(0.1, 1)  # Make room for the title
+)
+
+ggsave("heart_cv_figure_by_seeds.png",final_cv_figure,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+ggsave("heart_cv_by_seeds_and_epochs.png", final_cv_figure_titled,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+
+
+```
+
+
+```{r}
+set.seed(123)
+h_s_nmf <- singlet::run_nmf(A[spliced_indices, ], rank = best_rank_spliced , L1 = 0, tol = 1e-5)
+h_us_nmf <- singlet::run_nmf(A[unspliced_indices, ], rank = best_rank_unspliced, L1 = 0, tol = 1e-5)
+h_sus_nmf <- singlet::run_nmf(combined_counts, rank = best_rank_added, L1 = 0, tol = 1e-5)
+h_concat_nmf <- singlet::run_nmf(A, rank = best_rank_concat, L1 = 0, tol = 1e-5)
+
+```
+
+
+```{r}
+save(
+  h_s_nmf, h_us_nmf, h_sus_nmf,h_concat_nmf,
+  file = "heart_nmf_final_models.RData"
+)
+
+```
+
+## PCA
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(irlba)      # for fast PCA
+library(ggplot2)
+library(dplyr)
+
+
+
+# --- Define helper for PCA + scree data ---
+get_pca_scree <- function(expr_matrix, label, n_pcs = 50) {
+  expr_matrix <- as.matrix(expr_matrix)
+  expr_matrix <- expr_matrix[Matrix::rowSums(expr_matrix) > 0, ]
+  expr_matrix <- t(scale(t(expr_matrix), center = TRUE, scale = TRUE))
+  
+  pca_res <- prcomp_irlba(expr_matrix, n = n_pcs, center = FALSE, scale. = FALSE)
+  var_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+  
+  data.frame(
+    PC = seq_along(var_explained),
+    VarianceExplained = var_explained,
+    Modality = label
+  )
+}
+
+# --- Run PCA on each modality ---
+scree_spliced <- get_pca_scree(A[spliced_indices, ], "spliced")
+scree_unspliced <- get_pca_scree(A[unspliced_indices, ], "unspliced")
+scree_concat <- get_pca_scree(A, "concat")
+scree_added <- get_pca_scree(combined_counts, "added")
+
+scree_df <- bind_rows(scree_spliced, scree_unspliced, scree_concat, scree_added)
+
+# --- Faceted PCA Scree Plot ---
+ggplot(scree_df, aes(x = PC, y = VarianceExplained)) +
+  geom_line(size = 1, color = "steelblue") +
+  geom_point(size = 1.5, color = "black") +
+  facet_wrap(~Modality, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "PCA Scree Plot by Modality",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+
+```
+
+```{r}
+save(
+  scree_df, scree_concat, scree_spliced,
+  scree_unspliced,scree_added,
+  file = "heart_PCA.RData"
+)
+```
+
+
+
+```{r}
+
+load("heart_PCA.RData")  # should contain `scree_df`
+
+final_plot<- ggplot(scree_df, aes(x = PC, y = VarianceExplained, color = Modality)) +
+  geom_line(size = 0.8, alpha = 0.9) +
+  geom_point(size = 1.5, alpha = 0.9) +
+  scale_x_continuous(breaks = seq(0, 50, 10)) +
+  scale_y_continuous(expand = c(0.01, 0.01)) +
+  labs(
+    title = "PCA Scree Plot (Explained Variance by Component)",
+    subtitle = "Heart Data",
+    x = "Principal Component",
+    y = "Explained Variance",
+    color = "Modality"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "#333333"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("heart_pca.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+
+```
+
+
+
+## Violin plot
+
+```{r}
+
+load("heart_nmf_final_models.RData")
+set.seed(123)
+s_nmf <- singlet::run_nmf(A[spliced_indices, ], rank = best_rank_spliced , L1 = 0, tol = 1e-5)
+us_nmf <- singlet::run_nmf(A[unspliced_indices, ], rank = best_rank_unspliced, L1 = 0, tol = 1e-5)
+concat_nmf <- singlet::run_nmf(A, rank = best_rank_concat, L1 = 0, tol = 1e-5)
+
+
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+
+spliced_indices <- grep("_s$", rownames(concat_nmf$w))
+unspliced_indices <- grep("_us$", rownames(concat_nmf$w))
+
+heart_scores <- data.frame(
+  nmf_factor = 1:ncol(concat_nmf$w),
+  spliced = colSums(concat_nmf$w[spliced_indices,]),
+  unspliced = colSums(concat_nmf$w[unspliced_indices,])
+)
+heart_scores$Dataset <- "Heart"
+
+p1 <- ggplot(heart_scores, aes(x = "factors", y = spliced)) + geom_violin() + geom_jitter(width = 0.1) + theme_classic() + 
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  theme(aspect.ratio = 2) + 
+  labs(y = "Proportion of Spliced Weights per Factor", x = "")
+
+
+library(cowplot)
+#fig1 <- plot_grid(p1 + theme(aspect.ratio = 3), p2, nrow = 1, labels = c("A", "B"), rel_widths = c(1, 2))
+ggsave("violin_heart.png", plot = p1, width = 6, height = 4, units = "in", dpi = 300, bg = "#ffffff")
+
+
+
+
+```
+
+
+## Fig 1
+```{r}
+load("heart_nmf_cv_results.RData")
+
+# label all individual cross-validation runs by group and rbind them
+df_added <- cv_results_added
+df_s <- cv_results_spliced
+df_us <- cv_results_unspliced
+df_concat <- cv_results_concat
+
+df_added$group    <- "Added"
+df_s$group      <- "Spliced Only"
+df_us$group     <- "Unspliced Only"
+df_concat$group <- "Concatenated"
+
+# Combine all into one dataframe
+df <- rbind(df_added, df_s, df_us, df_concat)
+df$iter <- df$iter + 1
+
+# first generate a plot for Fig 1
+# Load plotting libraries
+library(ggplot2)
+library(viridis)
+
+# Set limits for y-axis
+lower_limit <- min(df$test_err) * 0.98
+upper_limit <- max(df$test_err[df$iter == 1])
+
+# Panel A: Test error vs. rank
+p1 <- ggplot(df, aes(x = k, y = test_err, color = iter, group = iter)) +
+  geom_line() +
+  scale_color_viridis_c(option = "B") +
+  theme_classic() +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Rank", color = "Epoch") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Panel B: Epoch trajectories for underfit, better fit, and overfit models
+plot_data <- subset(df, k == 5 | k == 30 | k == 80)
+plot_data$k <- factor(plot_data$k)
+levels(plot_data$k) <- c("Underfit (k = 5)", "Better Fit (k = 30)", "Overfit (k = 80)")
+
+p2 <- ggplot(plot_data, aes(x = iter, y = test_err, color = k, group = k)) +
+  geom_line(size = 0.5) +
+  theme_classic() +
+  scale_color_viridis_d(option = "B", end = 0.9, begin = 0.1) +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Epoch", color = "Rank")
+
+# Combine and save
+library(cowplot)
+final_plot <- plot_grid(p1, p2, labels = c("A", "B"), nrow = 2, align = "hv")
+ggsave("heart_cv_figure_with_concat.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+```
+
+
+## Supplemental figure
+```{r}
+
+# load grouped CV data (the lists of 3 replicates each)
+load("heart_rank_sweep_results.RData")
+
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(cowplot)
+
+# helper: bind one group of 3 replicates and tag with group + replicate id
+bind_replicates <- function(lst, group_name) {
+  bind_rows(
+    lapply(seq_along(lst), function(i) {
+      df <- lst[[i]]
+      df$replicate <- i
+      df
+    })
+  ) %>%
+    mutate(group = group_name)
+}
+
+# build one big df of ALL groups, ALL replicates
+df_all <- bind_rows(
+  bind_replicates(h_added_cv,     "Added"),
+  bind_replicates(h_spliced_cv,   "Spliced Only"),
+  bind_replicates(h_unspliced_cv, "Unspliced Only"),
+  bind_replicates(h_concat_cv,    "Concatenated")
+)
+
+# iter in your earlier code was 0-based; make it 1-based again
+df_all <- df_all %>%
+  mutate(iter = iter + 1)
+
+# compute replicate-mean test_err for each group/rank/epoch
+df_mean <- df_all %>%
+  group_by(group, k, iter) %>%
+  summarise(test_err = mean(test_err, na.rm = TRUE), .groups = "drop") %>%
+  mutate(replicate = "mean")
+
+# y-limits using ALL replicates (so panels line up)
+lower_limit <- min(df_all$test_err) * 0.98
+upper_limit <- max(df_all$test_err[df_all$iter == 1])
+
+## PANEL A: Test error vs rank
+# we'll plot all replicates in faint lines + mean as thick line
+p1 <- ggplot() +
+  # individual replicates (faint)
+  geom_line(
+    data = df_all,
+    aes(x = k, y = test_err, group = interaction(replicate, iter), color = iter),
+    alpha = 0.35, linewidth = 0.3
+  ) +
+  # mean across replicates (thicker)
+  geom_line(
+    data = df_mean,
+    aes(x = k, y = test_err, color = iter, group = iter),
+    linewidth = 0.9
+  ) +
+  facet_grid(cols = vars(group)) +
+  scale_color_viridis_c(option = "B") +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) +
+  labs(
+    y = "Test Set Loss",
+    x = "NMF Model Rank",
+    color = "Epoch"
+  ) +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    plot.title = element_text(hjust = 0.5)
+  )
+
+## PANEL B: epoch trajectories for selected ks
+plot_data_all <- df_all %>% filter(k %in% c(5, 30, 80))
+plot_data_mean <- df_mean %>% filter(k %in% c(5, 30, 80))
+
+# nice labels
+k_labs <- c("5" = "Underfit (k = 5)",
+            "30" = "Better Fit (k = 30)",
+            "80" = "Overfit (k = 80)")
+
+plot_data_all$k <- factor(plot_data_all$k, levels = c(5, 30, 80), labels = k_labs)
+plot_data_mean$k <- factor(plot_data_mean$k, levels = c(5, 30, 80), labels = k_labs)
+
+p2 <- ggplot() +
+  # individual replicates
+  geom_line(
+    data = plot_data_all,
+    aes(x = iter, y = test_err, group = interaction(replicate, k), color = k),
+    alpha = 0.35, linewidth = 0.4
+  ) +
+  # mean across replicates
+  geom_line(
+    data = plot_data_mean,
+    aes(x = iter, y = test_err, color = k, group = k),
+    linewidth = 1
+  ) +
+  facet_grid(cols = vars(group)) +
+  scale_color_viridis_d(option = "B", end = 0.9, begin = 0.1) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) +
+  labs(
+    y = "Test Set Loss",
+    x = "NMF Model Epoch",
+    color = "Rank"
+  ) +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+# combine just like before
+final_plot <- plot_grid(p1, p2, labels = c("A", "B"), nrow = 2, align = "hv")
+
+
+# Add figure title
+final_plot <- plot_grid(
+  ggdraw() + 
+    draw_label(
+      "Cross-Validation Performance of NMF Models Across Modalities (Heart Dataset)",
+      fontface = "bold",
+      size = 16,
+      hjust = 0.5
+    ),
+  final_plot,
+  ncol = 1,
+  rel_heights = c(0.08, 1)
+)
+
+
+ggsave(
+  "heart_cv_figure_with_concat_and_replicates.png",
+  plot = final_plot,
+  width = 12, height = 6.5, units = "in",
+  bg = "#ffffff", dpi = 300
+)
+
+
+
+```
+
+## Supplemental table
+Test mean squared error (MSE) at the final iteration (epoch 50) for each NMF rank (k) across all modalities and replicates.
+```{r}
+
+df_all <- df_all %>%
+  mutate(group = dplyr::recode(
+    group,
+    "Spliced Only"   = "SplicedOnly",
+    "Unspliced Only" = "UnsplicedOnly"
+  ))
+
+# Filter for iteration 50
+df_iter50 <- df_all %>%
+  filter(iter == 50) %>% 
+  mutate(group_rep = paste0(group, "_rep", replicate)) %>%
+  select(k, group_rep, test_err)
+
+
+df_iter50_superwide <- df_iter50 %>%
+  pivot_wider(names_from = group_rep, values_from = test_err) %>%
+  mutate(across(-k, ~ round(.x, 4))) %>%
+  arrange(k)
+
+print(df_iter50_superwide)
+
+# Export
+write.csv(df_iter50_superwide,
+          "heart_iter50_test_mse_by_modality_and_replicate.csv",
+          row.names = FALSE)
+
+
+```
+
+
+## Heatmap
+
+```{r}
+
+load("heart_nmf_final_models.RData")
+library(RcppML)
+concat_nmf <- h_concat_nmf$w
+s_nmf <- h_s_nmf$w
+us_nmf <- h_us_nmf$w
+added_nmf <- h_sus_nmf$w
+
+# combine them all!
+w <- cbind(sus_nmf[1:(nrow(concat_nmf)/2),], added_nmf, s_nmf, us_nmf)
+modalities <- c(rep("concatenated", ncol(concat_nmf)),
+                rep("added", ncol(added_nmf)),
+                rep("spliced", ncol(s_nmf)),
+                rep("unspliced", ncol(us_nmf)))
+
+# l2 norm on w
+
+w <- apply(w, 2, function(x) x / sqrt(sum(x^2)))
+G <- crossprod(w)
+# comparison between concatenated and unspliced needs to be modified
+G_adj <- RcppML::cosine(concat_nmf[(nrow(concat_nmf)/2 + 1): nrow(concat_nmf),], us_nmf)
+G[1:ncol(concat_nmf), (ncol(G) - ncol(us_nmf) + 1):ncol(G)] <- G_adj
+G[lower.tri(G)] <- t(G)[lower.tri(G)]
+
+# reorder based on bipartite matching against concatenated or added
+order <- c(
+  hclust(dist(t(G[,which(modalities == "concatenated")])))$order,
+  hclust(dist(t(G[,which(modalities == "added")])))$order + min(which(modalities == "added")) - 1,
+  hclust(dist(t(G[,which(modalities == "spliced")])))$order + min(which(modalities == "spliced")) - 1,
+  hclust(dist(t(G[,which(modalities == "unspliced")])))$order + min(which(modalities == "unspliced")) - 1)
+
+G <- G[order, order]
+G_ <- G
+rownames(G_) <- colnames(G_) <- 1:ncol(G_)
+colnames(G) <- rownames(G) <- modalities
+df <- reshape2::melt(G)
+df2 <- reshape2::melt(G_)
+plot_data <- data.frame("x" = df2$Var1, "y" = df2$Var2, "sim" = df2$value, "modality1" = df$Var1, "modality2" = df$Var2)
+
+p1 <- ggplot(plot_data, aes(x, y, fill = sim)) + geom_tile() + theme_classic() + scale_fill_viridis_c(option = "B", end = 0.9) + scale_y_continuous(expand = c(0.01, 0.01)) + scale_x_reverse(expand = c(0.01, 0.01)) + facet_grid(rows = vars(modality2), cols = vars(modality1), space = "free", scales = "free") + theme(axis.ticks = element_blank(), axis.text= element_blank()) + labs(fill = "Similarity", x = "NMF factors", y = "NMF factors") + theme(axis.line = element_blank())
+
+# box plot of 4-way comparison
+# y-axis per-factor cost of bipartite matching
+
+models <- list("concatenated" = concat_nmf[1:nrow(added_nmf),], "added" = added_nmf, "spliced" = s_nmf, "unspliced" = us_nmf)
+# concatenated model is truncated to spliced reads only
+# we will need to modify the pairing for unspliced to concatenated
+results <- list()
+for(i in 1:length(models)){
+  for(j in 1:length(models)){
+    if(i != j){
+      model1_name <- names(models)[[i]]
+      model2_name <- names(models)[[j]]
+      model1 <- apply(models[[i]], 2, function(x) x / sqrt(sum(x^2)))
+      model2 <- apply(models[[j]], 2, function(x) x / sqrt(sum(x^2)))
+      if(model1_name == "concatenated" && model2_name == "unspliced"){
+        model1 <- apply(concat_nmf[(nrow(concat_nmf)/2 + 1):nrow(concat_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      if(model2_name == "concatenated" && model1_name == "unspliced"){
+        model2 <- apply(concat_nmf[(nrow(concat_nmf)/2 + 1):nrow(concat_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      cost <- 1 - crossprod(model1, model2)
+      if(ncol(cost) < nrow(cost)) cost <- t(cost)
+      pairs <- bipartiteMatch(cost)$pairs
+      for(k in 1:length(pairs)){
+        pairs[[k]] <- cost[k, pairs[[k]]]
+      }
+      results[[length(results) + 1]] <- data.frame("model1" = model1_name, "model2" = model2_name, "cost" = pairs)
+    }
+  }
+}
+results <- do.call(rbind, results)
+
+p2 <- ggplot(results, aes(model1, cost, color = model2)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.1), size = 1) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  labs(x = "NMF Model Modality", 
+       y = "Cost of factor bipartite matching", 
+       color = "Matched Modality") + 
+  theme(aspect.ratio = 1.5) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+p3 <- cowplot::plot_grid(p1, p2, nrow = 1, rel_widths = c(1, 0.7), labels = c("A", "B"))
+ggsave("heart_figure_3.png", p3, width = 12, height = 6, units = "in", bg = "#ffffff", dpi = 300)
+
+
+```
+
+# Neuron
+
+```{r}
+# Load gene expression data (spliced and unspliced counts) and metadata
+folder <- "/mnt/home/jadharya/gene_files/raw_loom_10x_vc/neuron_10k_v3_cr_extracted"
+
+spliced_counts   <- read_npz_into_R(file.path(folder, "neuron_10k_v3_cr_spliced.npz"))
+unspliced_counts <- read_npz_into_R(file.path(folder, "neuron_10k_v3_cr_unspliced.npz"))
+gene_data <- read.csv(file.path(folder, "neuron_10k_v3_cr_genes.tsv"), sep = "\t", header = F)
+cell_data <- read.csv(file.path(folder, "neuron_10k_v3_cr_barcodes.tsv"), sep = "\t", header = F)
+colnames(spliced_counts) <- colnames(unspliced_counts) <- as.character(cell_data[,1])
+rownames(spliced_counts) <- paste0(as.character(gene_data[,1]), "_s")
+rownames(unspliced_counts) <- paste0(as.character(gene_data[,1]), "_us")
+A <- rbind(spliced_counts, unspliced_counts)
+spliced_indices <- 1:nrow(spliced_counts)
+unspliced_indices <- (nrow(spliced_counts) + 1):nrow(A)
+
+# basic QC
+n_A <- A[, which(colSums(A != 0) > 200 & colSums(A != 0) < 15000 & colSums(A) > 500 & colSums(A) < 75000)]
+
+# standard log normalization
+n_A <- Seurat::LogNormalize(n_A)
+
+
+# Also save a version of gene names without suffix for merging later
+gene_names <- as.character(gene_data[,1])
+rownames(spliced_counts) <- rownames(unspliced_counts) <- gene_names
+
+# New: Create the added (summed) version
+n_combined_counts <- spliced_counts + unspliced_counts
+
+# Apply same QC as to A
+# Retain only cells with sufficient counts
+n_combined_counts <- n_combined_counts[, which(
+  colSums(n_combined_counts != 0) > 200 & 
+  colSums(n_combined_counts != 0) < 15000 &
+  colSums(n_combined_counts) > 500 & 
+  colSums(n_combined_counts) < 75000
+)]
+
+# Apply normalization
+n_combined_counts <- Seurat::LogNormalize(n_combined_counts)
+
+
+```
+
+
+```{r}
+# Save processed matrices and index vectors for reuse
+save(
+  n_A,
+  spliced_indices,
+  unspliced_indices,
+  n_combined_counts,
+  file = "neuron_log_normalized_data.RData"
+)
+
+```
+
+```{r}
+load("neuron_log_normalized_data.RData")
+
+```
+
+# Cross-validation of data
+
+```{r}
+# devtools::install_github("zdebruine/singlet")
+library(singlet)
+
+cross_val <- function(A, ranks = 2:80){
+  cv_data <- singlet::cross_validate_nmf(A, ranks,
+                                         n_replicates = 3,
+                                         trace_test_mse = 1,
+                                         maxit = 50, tol = -1, tol_overfit = Inf)
+  cv_data <- aggregate(cv_data$test_error, by = list(cv_data$k, cv_data$iter), FUN = mean)
+  colnames(cv_data) <- c("k", "iter", "test_err")
+  return(cv_data)
+}
+
+get_best_rank <- function(cv_data){
+  unique(cv_data$k)[which.min(sapply(unique(cv_data$k), function(x) {
+    tail(cv_data[cv_data$k == x, "test_err"], n = 1L)
+  }))]
+}
+```
+
+```{r}
+# Run cross-validation for all modalities (concatenated, spliced-only, unspliced-only, added)
+set.seed(43)
+n_cv_results_concat <- cross_val(n_A, ranks = 2:80)
+n_best_rank_concat <- get_best_rank(n_cv_results_concat)
+n_cv_results_spliced <- cross_val(n_A[spliced_indices, ], ranks = 2:80)
+n_best_rank_spliced <- get_best_rank(n_cv_results_spliced)
+n_cv_results_unspliced <- cross_val(n_A[unspliced_indices, ], ranks = 2:80)
+n_best_rank_unspliced <- get_best_rank(n_cv_results_unspliced)
+n_cv_results_added <- cross_val(n_combined_counts, ranks = 2:80)
+n_best_rank_added <- get_best_rank(n_cv_results_added)
+```
+
+
+```{r}
+
+# Save all cross-validation results for later use
+
+save(
+  n_A,
+  n_cv_results_spliced,
+  n_best_rank_spliced,
+  n_cv_results_unspliced,
+  n_best_rank_unspliced,
+  n_cv_results_concat,
+  n_best_rank_concat,
+  n_cv_results_added,
+  n_best_rank_added,
+  file = "neuron_nmf_cv_results.RData"
+)
+
+
+```
+
+```{r}
+
+load("neuron_nmf_cv_results.RData")
+# Output best ranks selected for each modality
+n_best_rank_concat
+n_best_rank_spliced
+n_best_rank_unspliced
+n_best_rank_added
+
+```
+
+
+```{r}
+# Run cross-validation again with different seeds to assess stability
+
+set.seed(44)
+n_cv_results_concat2 <- cross_val(n_A, ranks = 2:80)
+n_best_rank_concat2 <- get_best_rank(n_cv_results_concat2)
+n_cv_results_spliced2 <- cross_val(n_A[spliced_indices, ], ranks = 2:80)
+n_best_rank_spliced2 <- get_best_rank(n_cv_results_spliced2)
+n_cv_results_unspliced2 <- cross_val(n_A[unspliced_indices, ], ranks = 2:80)
+n_best_rank_unspliced2 <- get_best_rank(n_cv_results_unspliced2)
+n_cv_results_added2 <- cross_val(n_combined_counts, ranks = 2:80)
+n_best_rank_added2 <- get_best_rank(n_cv_results_added2)
+```
+
+
+```{r}
+# Save second set of CV results
+save(
+  n_cv_results_spliced2,
+  n_best_rank_spliced2,
+  n_cv_results_unspliced2,
+  n_best_rank_unspliced2,
+  n_cv_results_concat2,
+  n_best_rank_concat2,
+  n_cv_results_added2,
+  n_best_rank_added2,
+  file = "neuron_nmf_cv_results2.RData"
+)
+
+```
+
+```{r}
+load("neuron_nmf_cv_results2.RData")
+```
+
+```{r}
+# Run third round of cross-validation for robustness
+set.seed(45)
+n_cv_results_concat3 <- cross_val(n_A, ranks = 2:80)
+n_best_rank_concat3 <- get_best_rank(n_cv_results_concat3)
+n_cv_results_spliced3 <- cross_val(n_A[spliced_indices, ], ranks = 2:80)
+n_best_rank_spliced3 <- get_best_rank(n_cv_results_spliced3)
+n_cv_results_unspliced3 <- cross_val(n_A[unspliced_indices, ], ranks = 2:80)
+n_best_rank_unspliced3 <- get_best_rank(n_cv_results_unspliced3)
+n_cv_results_added3 <- cross_val(n_combined_counts, ranks = 2:80)
+n_best_rank_added3 <- get_best_rank(n_cv_results_added3)
+
+```
+
+```{r}
+# Save third set of CV results
+save(
+  n_cv_results_spliced3,
+  n_best_rank_spliced3,
+  n_cv_results_unspliced3,
+  n_best_rank_unspliced3,
+  n_cv_results_concat3,
+  n_best_rank_concat3,
+  n_cv_results_added3,
+  n_best_rank_added3,
+  file = "neuron_nmf_cv_results3.RData"
+)
+
+```
+
+```{r}
+load("neuron_nmf_cv_results3.RData")
+```
+
+
+```{r}
+# Combine all 3 replicate results into lists for grouped analysis
+n_concat_cv <- list(n_cv_results_concat, n_cv_results_concat2, n_cv_results_concat3)
+n_spliced_cv  <- list(n_cv_results_spliced, n_cv_results_spliced2, n_cv_results_spliced3)
+n_unspliced_cv <- list(n_cv_results_unspliced, n_cv_results_unspliced2, n_cv_results_unspliced3)
+n_added_cv <- list(n_cv_results_added,n_cv_results_added2, n_cv_results_added3)
+
+```
+
+```{r}
+# Save grouped CV data
+save(
+  n_concat_cv, n_spliced_cv, n_unspliced_cv,n_added_cv,
+  file = "neuron_rank_sweep_results.RData"
+)
+
+```
+
+```{r}
+load("neuron_rank_sweep_results.RData")
+
+```
+
+
+
+## CV figure by seeds
+```{r}
+label_cv_df <- function(cv_list, source_label) {
+  dplyr::bind_rows(lapply(seq_along(cv_list), function(i) {
+    df <- cv_list[[i]]
+    df$replicate <- i
+    df$source <- source_label
+    return(df)
+  }))
+}
+
+# Label and combine CV results
+n_cv_concat_all <- label_cv_df(n_concat_cv, "Concat") %>% mutate(seed = replicate)
+n_cv_spliced_all  <- label_cv_df(n_spliced_cv, "Spliced") %>% mutate(seed = replicate)
+n_cv_unspliced_all <- label_cv_df(n_unspliced_cv, "Unspliced") %>% mutate(seed = replicate)
+n_cv_added_all <- label_cv_df(n_added_cv, "Added") %>% mutate(seed = replicate)
+
+# Combine all into one data frame
+n_cv_all <- bind_rows(n_cv_concat_all, n_cv_spliced_all, n_cv_unspliced_all,n_cv_added_all)
+
+# Order factor levels for consistent plotting
+n_cv_all$source <- factor(n_cv_all$source, levels = c("Concat", "Spliced", "Unspliced", "Added"))
+
+# Summary statistics per seed, source, and rank
+n_cv_all_summary <- n_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(
+    mean_err = mean(test_err),
+    sd_err = sd(test_err),
+    .groups = "drop"
+  )
+
+# Best k per seed and source
+n_best_k_by_seed <- n_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(mean_err = mean(test_err), .groups = "drop") %>%
+  group_by(seed, source) %>%
+  slice_min(mean_err, n = 1) %>%
+  rename(best_k = k)
+```
+
+```{r}
+# Plot
+#This plot shows the mean test error ± standard deviation across different ranks (k) for each modality (Concat, Spliced, Unspliced, Added) across 3 random seeds.
+
+fig3 <- ggplot(n_cv_all_summary, aes(x = k, y = mean_err, color = source, fill = source)) +
+  geom_line(size = 1) +
+  geom_vline(data = n_best_k_by_seed, aes(xintercept = best_k), linetype = "dashed", color = "black") +
+  geom_text(
+    data = n_best_k_by_seed,
+    aes(x = best_k, y = Inf, label = paste0("k=", best_k)),
+    vjust = -0.5, hjust = 0, angle = 90, size = 3, color = "black", inherit.aes = FALSE
+  ) +
+  #geom_ribbon(aes(ymin = mean_err - sd_err, ymax = mean_err + sd_err), alpha = 0.2, color = NA) +
+  facet_grid(seed ~ source, scales = "fixed") +
+  labs(
+    title = "Neuron NMF CV Error by Rank and Seed",
+    subtitle = "Mean ± SD for each modality and seed",
+    x = "Rank (k)", y = "Test Error"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+ggsave("new_cv_error_byseed_neuron.png", plot = fig3, width = 12.5, height = 5.5, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+```{r}
+n_cv_all <- n_cv_all %>% rename(epoch = iter)
+
+
+panel_a <- ggplot(n_cv_all, aes(x = k, y = test_err, group = epoch, color = epoch)) +
+  geom_line(size = 0.3, alpha = 0.9) +
+  facet_grid(seed ~ source) +
+  scale_color_viridis_c(name = "Epoch", direction = -1) +
+  labs(
+    x = "NMF Model Rank",
+    y = "Test Set Loss",
+    title = "A"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+selected_ranks <- c(5, 30, 80)
+rank_labels <- c("5" = "Underfit (k = 5)", "30" = "Better Fit (k = 30)", "80" = "Overfit (k = 80)")
+
+n_cv_subset <- n_cv_all %>% filter(k %in% selected_ranks)
+
+panel_b <- ggplot(n_cv_subset, aes(x = epoch, y = test_err, color = factor(k))) +
+  geom_line(size = 1) +
+  facet_grid(seed ~ source) +
+  scale_color_manual(
+    name = "Rank",
+    values = c("5" = "black", "30" = "red", "80" = "gold"),
+    labels = rank_labels
+  ) +
+  labs(
+    x = "NMF Model Epoch",
+    y = "Test Set Loss",
+    title = "B"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+library(cowplot)
+
+# plot to show Test error over epochs for all ranks
+final_cv_figure <- plot_grid(panel_a, panel_b, ncol = 1, labels = NULL, rel_heights = c(1.2, 1))
+n_final_cv_figure_titled <- plot_grid(
+  ggdraw() + 
+    draw_label("CV Error Trajectories by Epoch and Rank for Neuron Dataset", 
+               fontface = 'bold', 
+               x = 0.5, 
+               hjust = 0.5, 
+               size = 16), 
+  final_cv_figure, 
+  ncol = 1, 
+  rel_heights = c(0.1, 1)  # Make room for the title
+)
+
+ggsave("neuron_cv_figure_by_seeds.png",final_cv_figure,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+ggsave("neuron_cv_by_seeds_and_epochs.png",n_final_cv_figure_titled,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+
+
+```
+
+
+```{r}
+set.seed(123)
+n_s_nmf <- singlet::run_nmf(n_A[spliced_indices, ], rank = n_best_rank_spliced , L1 = 0, tol = 1e-5)
+n_us_nmf <- singlet::run_nmf(n_A[unspliced_indices, ], rank = n_best_rank_unspliced, L1 = 0, tol = 1e-5)
+n_sus_nmf <- singlet::run_nmf(n_combined_counts, rank = n_best_rank_added, L1 = 0, tol = 1e-5)
+n_concat_nmf <- singlet::run_nmf(n_A, rank = n_best_rank_concat, L1 = 0, tol = 1e-5)
+
+```
+
+```{r}
+save(
+  n_s_nmf, n_us_nmf, n_sus_nmf,n_concat_nmf,
+  file = "neuron_nmf_final_models.RData"
+)
+
+```
+
+
+
+## PCA
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(irlba)      # for fast PCA
+library(ggplot2)
+library(dplyr)
+
+
+
+# --- Define helper for PCA + scree data ---
+get_pca_scree <- function(expr_matrix, label, n_pcs = 50) {
+  expr_matrix <- as.matrix(expr_matrix)
+  expr_matrix <- expr_matrix[Matrix::rowSums(expr_matrix) > 0, ]
+  expr_matrix <- t(scale(t(expr_matrix), center = TRUE, scale = TRUE))
+  
+  pca_res <- prcomp_irlba(expr_matrix, n = n_pcs, center = FALSE, scale. = FALSE)
+  var_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+  
+  data.frame(
+    PC = seq_along(var_explained),
+    VarianceExplained = var_explained,
+    Modality = label
+  )
+}
+
+# --- Run PCA on each modality ---
+n_scree_spliced <- get_pca_scree(n_A[spliced_indices, ], "spliced")
+n_scree_unspliced <- get_pca_scree(n_A[unspliced_indices, ], "unspliced")
+n_scree_concat <- get_pca_scree(n_A, "concat")
+n_scree_added <- get_pca_scree(n_combined_counts, "added")
+
+n_scree_df <- bind_rows(n_scree_spliced, n_scree_unspliced, n_scree_concat, n_scree_added)
+
+# --- Faceted PCA Scree Plot ---
+ggplot(n_scree_df, aes(x = PC, y = VarianceExplained)) +
+  geom_line(size = 1, color = "steelblue") +
+  geom_point(size = 1.5, color = "black") +
+  facet_wrap(~Modality, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "PCA Scree Plot by Modality",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+
+```
+
+
+```{r}
+save(
+  n_scree_df, n_scree_concat, n_scree_spliced,
+  n_scree_unspliced,n_scree_added,
+  file = "neuron_PCA.RData"
+)
+```
+
+```{r}
+
+load("neuron_PCA.RData")
+
+final_plot<- ggplot(n_scree_df, aes(x = PC, y = VarianceExplained, color = Modality)) +
+  geom_line(size = 0.8, alpha = 0.9) +
+  geom_point(size = 1.5, alpha = 0.9) +
+  scale_x_continuous(breaks = seq(0, 50, 10)) +
+  scale_y_continuous(expand = c(0.01, 0.01)) +
+  labs(
+    title = "PCA Scree Plot (Explained Variance by Component)",
+    subtitle = "Neuron Data",
+    x = "Principal Component",
+    y = "Explained Variance",
+    color = "Modality"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "#333333"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("neuron_pca.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+
+
+```
+
+## Violin plot
+
+```{r}
+load("neuron_nmf_final_models.RData")
+set.seed(123)
+n_s_nmf <- singlet::run_nmf(n_A[spliced_indices, ], rank = n_best_rank_spliced , L1 = 0, tol = 1e-5)
+n_us_nmf <- singlet::run_nmf(n_A[unspliced_indices, ], rank = n_best_rank_unspliced, L1 = 0, tol = 1e-5)
+n_sus_nmf <- singlet::run_nmf(n_A, rank = n_best_rank_concat, L1 = 0, tol = 1e-5)
+
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+
+spliced_indices <- grep("_s$", rownames(n_sus_nmf$w))
+unspliced_indices <- grep("_us$", rownames(n_sus_nmf$w))
+
+neuron_scores <- data.frame(
+  nmf_factor = 1:ncol(n_sus_nmf$w),
+  spliced = colSums(n_sus_nmf$w[spliced_indices,]),
+  unspliced = colSums(n_sus_nmf$w[unspliced_indices,])
+)
+neuron_scores$Dataset <- "Neuron"
+
+p2 <- ggplot(neuron_scores, aes(x = "factors", y = spliced)) + geom_violin() + geom_jitter(width = 0.1) + theme_classic() + 
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  theme(aspect.ratio = 2) + 
+  labs(y = "Proportion of Spliced Weights per Factor", x = "")
+
+
+ggsave("violin_neuron.png", plot = p2, width = 6, height = 4, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+## Fig 1
+```{r}
+load("neuron_nmf_cv_results.RData")
+
+# label all individual cross-validation runs by group and rbind them
+n_df_sus <- n_cv_results_added
+n_df_s <- n_cv_results_spliced
+n_df_us <- n_cv_results_unspliced
+n_df_concat <- n_cv_results_concat
+
+n_df_sus$group    <- "Added"
+n_df_s$group      <- "Spliced Only"
+n_df_us$group     <- "Unspliced Only"
+n_df_concat$group <- "Concatenated"
+
+# Combine all into one dataframe
+n_df <- rbind(n_df_sus, n_df_s, n_df_us, n_df_concat)
+n_df$iter <- n_df$iter + 1
+
+# first generate a plot for Fig 1
+# Load plotting libraries
+library(ggplot2)
+library(viridis)
+
+# Set limits for y-axis
+lower_limit <- min(n_df$test_err) * 0.98
+upper_limit <- max(n_df$test_err[n_df$iter == 1])
+
+# Panel A: Test error vs. rank
+p1 <- ggplot(n_df, aes(x = k, y = test_err, color = iter, group = iter)) +
+  geom_line() +
+  scale_color_viridis_c(option = "B") +
+  theme_classic() +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Rank", color = "Epoch") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Panel B: Epoch trajectories for underfit, better fit, and overfit models
+plot_data <- subset(n_df, k == 5 | k == 30 | k == 80)
+plot_data$k <- factor(plot_data$k)
+levels(plot_data$k) <- c("Underfit (k = 5)", "Better Fit (k = 30)", "Overfit (k = 80)")
+
+p2 <- ggplot(plot_data, aes(x = iter, y = test_err, color = k, group = k)) +
+  geom_line(size = 0.5) +
+  theme_classic() +
+  scale_color_viridis_d(option = "B", end = 0.9, begin = 0.1) +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Epoch", color = "Rank")
+
+# Combine and save
+library(cowplot)
+final_plot <- plot_grid(p1, p2, labels = c("A", "B"), nrow = 2, align = "hv")
+ggsave("neuron_cv_figure_with_concat.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+```
+
+## Heatmap
+```{r}
+
+load("neuron_nmf_final_models.RData")
+library(RcppML)
+sus_nmf <- n_concat_nmf$w
+s_nmf <- n_s_nmf$w
+us_nmf <- n_us_nmf$w
+s_plus_us_nmf <- n_sus_nmf$w
+
+# combine them all!
+w <- cbind(sus_nmf[1:(nrow(sus_nmf)/2),], s_plus_us_nmf, s_nmf, us_nmf)
+modalities <- c(rep("concatenated", ncol(sus_nmf)),
+                rep("added", ncol(s_plus_us_nmf)),
+                rep("spliced", ncol(s_nmf)),
+                rep("unspliced", ncol(us_nmf)))
+
+# l2 norm on w
+
+w <- apply(w, 2, function(x) x / sqrt(sum(x^2)))
+G <- crossprod(w)
+# comparison between concatenated and unspliced needs to be modified
+G_adj <- RcppML::cosine(sus_nmf[(nrow(sus_nmf)/2 + 1): nrow(sus_nmf),], us_nmf)
+G[1:ncol(sus_nmf), (ncol(G) - ncol(us_nmf) + 1):ncol(G)] <- G_adj
+G[lower.tri(G)] <- t(G)[lower.tri(G)]
+
+# reorder based on bipartite matching against concatenated or added
+order <- c(
+  hclust(dist(t(G[,which(modalities == "concatenated")])))$order,
+  hclust(dist(t(G[,which(modalities == "added")])))$order + min(which(modalities == "added")) - 1,
+  hclust(dist(t(G[,which(modalities == "spliced")])))$order + min(which(modalities == "spliced")) - 1,
+  hclust(dist(t(G[,which(modalities == "unspliced")])))$order + min(which(modalities == "unspliced")) - 1)
+
+G <- G[order, order]
+G_ <- G
+rownames(G_) <- colnames(G_) <- 1:ncol(G_)
+colnames(G) <- rownames(G) <- modalities
+df <- reshape2::melt(G)
+df2 <- reshape2::melt(G_)
+plot_data <- data.frame("x" = df2$Var1, "y" = df2$Var2, "sim" = df2$value, "modality1" = df$Var1, "modality2" = df$Var2)
+
+p1 <- ggplot(plot_data, aes(x, y, fill = sim)) + geom_tile() + theme_classic() + scale_fill_viridis_c(option = "B", end = 0.9) + scale_y_continuous(expand = c(0.01, 0.01)) + scale_x_reverse(expand = c(0.01, 0.01)) + facet_grid(rows = vars(modality2), cols = vars(modality1), space = "free", scales = "free") + theme(axis.ticks = element_blank(), axis.text= element_blank()) + labs(fill = "Similarity", x = "NMF factors", y = "NMF factors") + theme(axis.line = element_blank())
+
+# box plot of 4-way comparison
+# y-axis per-factor cost of bipartite matching
+
+models <- list("concatenated" = sus_nmf[1:nrow(s_plus_us_nmf),], "added" = s_plus_us_nmf, "spliced" = s_nmf, "unspliced" = us_nmf)
+# concatenated model is truncated to spliced reads only
+# we will need to modify the pairing for unspliced to concatenated
+results <- list()
+for(i in 1:length(models)){
+  for(j in 1:length(models)){
+    if(i != j){
+      model1_name <- names(models)[[i]]
+      model2_name <- names(models)[[j]]
+      model1 <- apply(models[[i]], 2, function(x) x / sqrt(sum(x^2)))
+      model2 <- apply(models[[j]], 2, function(x) x / sqrt(sum(x^2)))
+      if(model1_name == "concatenated" && model2_name == "unspliced"){
+        model1 <- apply(sus_nmf[(nrow(sus_nmf)/2 + 1):nrow(sus_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      if(model2_name == "concatenated" && model1_name == "unspliced"){
+        model2 <- apply(sus_nmf[(nrow(sus_nmf)/2 + 1):nrow(sus_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      cost <- 1 - crossprod(model1, model2)
+      if(ncol(cost) < nrow(cost)) cost <- t(cost)
+      pairs <- bipartiteMatch(cost)$pairs
+      for(k in 1:length(pairs)){
+        pairs[[k]] <- cost[k, pairs[[k]]]
+      }
+      results[[length(results) + 1]] <- data.frame("model1" = model1_name, "model2" = model2_name, "cost" = pairs)
+    }
+  }
+}
+results <- do.call(rbind, results)
+
+p2 <- ggplot(results, aes(model1, cost, color = model2)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.1), size = 1) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  labs(x = "NMF Model Modality", 
+       y = "Cost of factor bipartite matching", 
+       color = "Matched Modality") + 
+  theme(aspect.ratio = 1.5) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+p3 <- cowplot::plot_grid(p1, p2, nrow = 1, rel_widths = c(1, 0.7), labels = c("A", "B"))
+ggsave("neuron_figure_3.png", p3, width = 12, height = 6, units = "in", bg = "#ffffff", dpi = 300)
+
+
+```
+
+
+## Supplemental figure
+```{r}
+
+# load grouped CV data (the lists of 3 replicates each)
+load("neuron_rank_sweep_results.RData")
+
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(cowplot)
+
+# helper: bind one group of 3 replicates and tag with group + replicate id
+bind_replicates <- function(lst, group_name) {
+  bind_rows(
+    lapply(seq_along(lst), function(i) {
+      df <- lst[[i]]
+      df$replicate <- i
+      df
+    })
+  ) %>%
+    mutate(group = group_name)
+}
+
+# build one big df of ALL groups, ALL replicates
+n_df_all <- bind_rows(
+  bind_replicates(n_added_cv,     "Added"),
+  bind_replicates(n_spliced_cv,   "Spliced Only"),
+  bind_replicates(n_unspliced_cv, "Unspliced Only"),
+  bind_replicates(n_concat_cv,    "Concatenated")
+)
+
+# iter in your earlier code was 0-based; make it 1-based again
+n_df_all <- n_df_all %>%
+  mutate(iter = iter + 1)
+
+# compute replicate-mean test_err for each group/rank/epoch
+n_df_mean <- n_df_all %>%
+  group_by(group, k, iter) %>%
+  summarise(test_err = mean(test_err, na.rm = TRUE), .groups = "drop") %>%
+  mutate(replicate = "mean")
+
+# y-limits using ALL replicates (so panels line up)
+lower_limit <- min(n_df_all$test_err) * 0.98
+upper_limit <- max(n_df_all$test_err[df_all$iter == 1])
+
+## PANEL A: Test error vs rank
+# we'll plot all replicates in faint lines + mean as thick line
+p1 <- ggplot() +
+  # individual replicates (faint)
+  geom_line(
+    data = n_df_all,
+    aes(x = k, y = test_err, group = interaction(replicate, iter), color = iter),
+    alpha = 0.35, linewidth = 0.3
+  ) +
+  # mean across replicates (thicker)
+  geom_line(
+    data = n_df_mean,
+    aes(x = k, y = test_err, color = iter, group = iter),
+    linewidth = 0.9
+  ) +
+  facet_grid(cols = vars(group)) +
+  scale_color_viridis_c(option = "B") +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) +
+  labs(
+    y = "Test Set Loss",
+    x = "NMF Model Rank",
+    color = "Epoch"
+  ) +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    plot.title = element_text(hjust = 0.5)
+  )
+
+## PANEL B: epoch trajectories for selected ks
+plot_data_all <- n_df_all %>% filter(k %in% c(5, 30, 80))
+plot_data_mean <- n_df_mean %>% filter(k %in% c(5, 30, 80))
+
+# nice labels
+k_labs <- c("5" = "Underfit (k = 5)",
+            "30" = "Better Fit (k = 30)",
+            "80" = "Overfit (k = 80)")
+
+plot_data_all$k <- factor(plot_data_all$k, levels = c(5, 30, 80), labels = k_labs)
+plot_data_mean$k <- factor(plot_data_mean$k, levels = c(5, 30, 80), labels = k_labs)
+
+p2 <- ggplot() +
+  # individual replicates
+  geom_line(
+    data = plot_data_all,
+    aes(x = iter, y = test_err, group = interaction(replicate, k), color = k),
+    alpha = 0.35, linewidth = 0.4
+  ) +
+  # mean across replicates
+  geom_line(
+    data = plot_data_mean,
+    aes(x = iter, y = test_err, color = k, group = k),
+    linewidth = 1
+  ) +
+  facet_grid(cols = vars(group)) +
+  scale_color_viridis_d(option = "B", end = 0.9, begin = 0.1) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) +
+  labs(
+    y = "Test Set Loss",
+    x = "NMF Model Epoch",
+    color = "Rank"
+  ) +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+# combine just like before
+final_plot <- plot_grid(p1, p2, labels = c("A", "B"), nrow = 2, align = "hv")
+
+
+# Add figure title
+final_plot <- plot_grid(
+  ggdraw() + 
+    draw_label(
+      "Cross-Validation Performance of NMF Models Across Modalities (Neuron Dataset)",
+      fontface = "bold",
+      size = 16,
+      hjust = 0.5
+    ),
+  final_plot,
+  ncol = 1,
+  rel_heights = c(0.08, 1)
+)
+
+
+ggsave(
+  "neuron_cv_figure_with_concat_and_replicates.png",
+  plot = final_plot,
+  width = 12, height = 6.5, units = "in",
+  bg = "#ffffff", dpi = 300
+)
+
+
+
+```
+
+## Supplemental Table
+```{r}
+df_all <- df_all %>%
+  mutate(group = dplyr::recode(
+    group,
+    "Spliced Only"   = "SplicedOnly",
+    "Unspliced Only" = "UnsplicedOnly"
+  ))
+
+# Filter for iteration 50
+df_iter50 <- df_all %>%
+  filter(iter == 50) %>% 
+  mutate(group_rep = paste0(group, "_rep", replicate)) %>%
+  select(k, group_rep, test_err)
+
+
+df_iter50_superwide <- df_iter50 %>%
+  pivot_wider(names_from = group_rep, values_from = test_err) %>%
+  mutate(across(-k, ~ round(.x, 4))) %>%
+  arrange(k)
+
+print(df_iter50_superwide)
+
+# Export
+write.csv(df_iter50_superwide,
+          "neuron_iter50_test_mse_by_modality_and_replicate.csv",
+          row.names = FALSE)
+
+
+```
+
+
+# Brain data
+
+```{r}
+# Load gene expression data (spliced and unspliced counts) and metadata
+folder <- "/mnt/home/jadharya/gene_files/raw_loom_10x_vc/brain_5k_v3_cr_extracted"
+
+spliced_counts   <- read_npz_into_R(file.path(folder, "brain_5k_v3_cr_spliced.npz"))
+unspliced_counts <- read_npz_into_R(file.path(folder, "brain_5k_v3_cr_unspliced.npz"))
+gene_data <- read.csv(file.path(folder, "brain_5k_v3_cr_genes.tsv"), sep = "\t", header = F)
+cell_data <- read.csv(file.path(folder, "brain_5k_v3_cr_barcodes.tsv"), sep = "\t", header = F)
+
+# Assign column and row names
+colnames(spliced_counts) <- colnames(unspliced_counts) <- as.character(cell_data[,1])
+rownames(spliced_counts) <- paste0(as.character(gene_data[,1]), "_s")
+rownames(unspliced_counts) <- paste0(as.character(gene_data[,1]), "_us")
+
+# Concatenate matrices and identify row indices
+A <- rbind(spliced_counts, unspliced_counts)
+spliced_indices <- 1:nrow(spliced_counts)
+unspliced_indices <- (nrow(spliced_counts) + 1):nrow(A)
+
+# basic QC to filter out low-quality cells
+b_A <- A[, which(colSums(A != 0) > 200 & colSums(A != 0) < 15000 & colSums(A) > 500 & colSums(A) < 75000)]
+
+
+# standard log normalization
+b_A <- Seurat::LogNormalize(b_A)
+
+
+# Store raw gene names for future use (e.g., merging)
+gene_names <- as.character(gene_data[,1])
+rownames(spliced_counts) <- rownames(unspliced_counts) <- gene_names
+
+# Create the added (summed) version
+b_combined_counts <- spliced_counts + unspliced_counts
+
+# Apply same QC as to A
+# Retain only cells with sufficient counts
+b_combined_counts <- b_combined_counts[, which(
+  colSums(b_combined_counts != 0) > 200 & 
+  colSums(b_combined_counts != 0) < 15000 &
+  colSums(b_combined_counts) > 500 & 
+  colSums(b_combined_counts) < 75000
+)]
+
+# Apply normalization
+b_combined_counts <- Seurat::LogNormalize(b_combined_counts)
+
+
+```
+
+
+```{r}
+# Save processed matrices and index vectors for reuse
+save(
+  b_A,
+  spliced_indices,
+  unspliced_indices,
+  b_combined_counts,
+  file = "brain_log_normalized_data.RData"
+)
+
+```
+
+```{r}
+load("brain_log_normalized_data.RData")
+
+```
+
+# Cross-validation of data
+
+```{r}
+# devtools::install_github("zdebruine/singlet")
+library(singlet)
+
+cross_val <- function(A, ranks = 2:80){
+  cv_data <- singlet::cross_validate_nmf(A, ranks,
+                                         n_replicates = 3,
+                                         trace_test_mse = 1,
+                                         maxit = 50, tol = -1, tol_overfit = Inf)
+  cv_data <- aggregate(cv_data$test_error, by = list(cv_data$k, cv_data$iter), FUN = mean)
+  colnames(cv_data) <- c("k", "iter", "test_err")
+  return(cv_data)
+}
+
+get_best_rank <- function(cv_data){
+  unique(cv_data$k)[which.min(sapply(unique(cv_data$k), function(x) {
+    tail(cv_data[cv_data$k == x, "test_err"], n = 1L)
+  }))]
+}
+```
+
+```{r}
+# Run cross-validation for all modalities (concatenated, spliced-only, unspliced-only, added)
+set.seed(43)
+b_cv_results_concat <- cross_val(b_A, ranks = 2:80)
+b_best_rank_concat <- get_best_rank(b_cv_results_concat)
+b_cv_results_spliced <- cross_val(b_A[spliced_indices, ], ranks = 2:80)
+b_best_rank_spliced <- get_best_rank(b_cv_results_spliced)
+b_cv_results_unspliced <- cross_val(b_A[unspliced_indices, ], ranks = 2:80)
+b_best_rank_unspliced <- get_best_rank(b_cv_results_unspliced)
+b_cv_results_added <- cross_val(b_combined_counts, ranks = 2:80)
+b_best_rank_added <- get_best_rank(b_cv_results_added)
+```
+
+
+```{r}
+# Save all cross-validation results for later use
+save(
+  b_A,
+  b_cv_results_spliced,
+  b_best_rank_spliced,
+  b_cv_results_unspliced,
+  b_best_rank_unspliced,
+  b_cv_results_concat,
+  b_best_rank_concat,
+  b_cv_results_added,
+  b_best_rank_added,
+  file = "brain_nmf_cv_results.RData"
+)
+
+
+```
+
+```{r}
+
+load("brain_nmf_cv_results.RData")
+# Output best ranks selected for each modality
+b_best_rank_concat
+b_best_rank_spliced
+b_best_rank_unspliced
+b_best_rank_added
+
+```
+
+
+```{r}
+# Run cross-validation again with different seeds to assess stability
+
+set.seed(44)
+
+b_cv_results_concat2 <- cross_val(b_A, ranks = 2:80)
+b_best_rank_concat2 <- get_best_rank(b_cv_results_concat2)
+b_cv_results_spliced2 <- cross_val(b_A[spliced_indices, ], ranks = 2:80)
+b_best_rank_spliced2 <- get_best_rank(b_cv_results_spliced2)
+b_cv_results_unspliced2 <- cross_val(b_A[unspliced_indices, ], ranks = 2:80)
+b_best_rank_unspliced2 <- get_best_rank(b_cv_results_unspliced2)
+b_cv_results_added2 <- cross_val(b_combined_counts, ranks = 2:80)
+b_best_rank_added2 <- get_best_rank(b_cv_results_added2)
+
+```
+
+
+```{r}
+# Save second set of CV results
+save(
+  b_cv_results_spliced2,
+  b_best_rank_spliced2,
+  b_cv_results_unspliced2,
+  b_best_rank_unspliced2,
+  b_cv_results_concat2,
+  b_best_rank_concat2,
+  b_cv_results_added2,
+  b_best_rank_added2,
+  file = "brain_nmf_cv_results2.RData"
+)
+
+```
+
+```{r}
+load("brain_nmf_cv_results2.RData")
+```
+
+
+```{r}
+# Run third round of cross-validation for robustness
+set.seed(45)
+b_cv_results_concat3 <- cross_val(b_A, ranks = 2:80)
+b_best_rank_concat3 <- get_best_rank(b_cv_results_concat3)
+b_cv_results_spliced3 <- cross_val(b_A[spliced_indices, ], ranks = 2:80)
+b_best_rank_spliced3 <- get_best_rank(b_cv_results_spliced3)
+b_cv_results_unspliced3 <- cross_val(b_A[unspliced_indices, ], ranks = 2:80)
+b_best_rank_unspliced3 <- get_best_rank(b_cv_results_unspliced3)
+b_cv_results_added3 <- cross_val(b_combined_counts, ranks = 2:80)
+b_best_rank_added3 <- get_best_rank(b_cv_results_added3)
+
+```
+
+```{r}
+# Save third set of CV results
+save(
+  b_cv_results_spliced3,
+  b_best_rank_spliced3,
+  b_cv_results_unspliced3,
+  b_best_rank_unspliced3,
+  b_cv_results_concat3,
+  b_best_rank_concat3,
+  b_cv_results_added3,
+  b_best_rank_added3,
+  file = "brain_nmf_cv_results3.RData"
+)
+
+```
+
+```{r}
+load("brain_nmf_cv_results3.RData")
+```
+
+
+```{r}
+# Combine all 3 replicate results into lists for grouped analysis
+b_concat_cv <- list(b_cv_results_concat, b_cv_results_concat2, b_cv_results_concat3)
+b_spliced_cv  <- list(b_cv_results_spliced, b_cv_results_spliced2, b_cv_results_spliced3)
+b_unspliced_cv <- list(b_cv_results_unspliced, b_cv_results_unspliced2, b_cv_results_unspliced3)
+b_added_cv <- list(b_cv_results_added,b_cv_results_added2, b_cv_results_added3)
+
+```
+
+```{r}
+save(
+  b_concat_cv, b_spliced_cv, b_unspliced_cv,b_added_cv,
+  file = "brain_rank_sweep_results.RData"
+)
+
+```
+
+```{r}
+load("brain_rank_sweep_results.RData")
+
+```
+
+
+## CV figure by seeds
+```{r}
+label_cv_df <- function(cv_list, source_label) {
+  dplyr::bind_rows(lapply(seq_along(cv_list), function(i) {
+    df <- cv_list[[i]]
+    df$replicate <- i
+    df$source <- source_label
+    return(df)
+  }))
+}
+
+# Label and combine CV results
+b_cv_concat_all <- label_cv_df(b_concat_cv, "Concat") %>% mutate(seed = replicate)
+b_cv_spliced_all  <- label_cv_df(b_spliced_cv, "Spliced") %>% mutate(seed = replicate)
+b_cv_unspliced_all <- label_cv_df(b_unspliced_cv, "Unspliced") %>% mutate(seed = replicate)
+b_cv_added_all <- label_cv_df(b_added_cv, "Added") %>% mutate(seed = replicate)
+
+# Combine all into one data frame
+b_cv_all <- bind_rows(b_cv_concat_all, b_cv_spliced_all, b_cv_unspliced_all,b_cv_added_all)
+
+# Order factor levels for consistent plotting
+b_cv_all$source <- factor(b_cv_all$source, levels = c("Concat", "Spliced", "Unspliced", "Added"))
+
+# Summary statistics per seed, source, and rank
+b_cv_all_summary <- b_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(
+    mean_err = mean(test_err),
+    sd_err = sd(test_err),
+    .groups = "drop"
+  )
+
+# Best k per seed and source
+b_best_k_by_seed <- b_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(mean_err = mean(test_err), .groups = "drop") %>%
+  group_by(seed, source) %>%
+  slice_min(mean_err, n = 1) %>%
+  rename(best_k = k)
+
+```
+
+
+```{r}
+# Plot
+#This plot shows the mean test error ± standard deviation across different ranks (k) for each modality (Concat, Spliced, Unspliced, Added) across 3 random seeds.
+
+
+fig3 <- ggplot(b_cv_all_summary, aes(x = k, y = mean_err, color = source, fill = source)) +
+  geom_line(size = 1) +
+  geom_vline(data = b_best_k_by_seed, aes(xintercept = best_k), linetype = "dashed", color = "black") +
+  geom_text(
+    data = b_best_k_by_seed,
+    aes(x = best_k, y = Inf, label = paste0("k=", best_k)),
+    vjust = -0.5, hjust = 0, angle = 90, size = 3, color = "black", inherit.aes = FALSE
+  ) +
+  #geom_ribbon(aes(ymin = mean_err - sd_err, ymax = mean_err + sd_err), alpha = 0.2, color = NA) +
+  facet_grid(seed ~ source, scales = "fixed") +
+  labs(
+    title = "Brain NMF CV Error by Rank and Seed",
+    subtitle = "Mean ± SD for each modality and seed",
+    x = "Rank (k)", y = "Test Error"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+ggsave("new_cv_error_byseed_brain.png", plot = fig3, width = 12.5, height = 5.5, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+```{r}
+b_cv_all <- b_cv_all %>% rename(epoch = iter)
+
+
+panel_a <- ggplot(b_cv_all, aes(x = k, y = test_err, group = epoch, color = epoch)) +
+  geom_line(size = 0.3, alpha = 0.9) +
+  facet_grid(seed ~ source) +
+  scale_color_viridis_c(name = "Epoch", direction = -1) +
+  labs(
+    x = "NMF Model Rank",
+    y = "Test Set Loss",
+    title = "A"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+selected_ranks <- c(5, 30, 80)
+rank_labels <- c("5" = "Underfit (k = 5)", "30" = "Better Fit (k = 30)", "80" = "Overfit (k = 80)")
+
+b_cv_subset <- b_cv_all %>% filter(k %in% selected_ranks)
+
+panel_b <- ggplot(b_cv_subset, aes(x = epoch, y = test_err, color = factor(k))) +
+  geom_line(size = 1) +
+  facet_grid(seed ~ source) +
+  scale_color_manual(
+    name = "Rank",
+    values = c("5" = "black", "30" = "red", "80" = "gold"),
+    labels = rank_labels
+  ) +
+  labs(
+    x = "NMF Model Epoch",
+    y = "Test Set Loss",
+    title = "B"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+library(cowplot)
+
+final_cv_figure <- plot_grid(panel_a, panel_b, ncol = 1, labels = NULL, rel_heights = c(1.2, 1))
+b_final_cv_figure_titled <- plot_grid(
+  ggdraw() + 
+    draw_label("CV Error Trajectories by Epoch and Rank for Heart Dataset", 
+               fontface = 'bold', 
+               x = 0.5, 
+               hjust = 0.5, 
+               size = 16), 
+  final_cv_figure, 
+  ncol = 1, 
+  rel_heights = c(0.1, 1)  # Make room for the title
+)
+
+ggsave("brain_cv_figure_by_seeds.png", final_cv_figure,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+ggsave("brain_cv_by_seeds_and_epochs.png", b_final_cv_figure_titled,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+```
+
+
+```{r}
+set.seed(123)
+b_s_nmf <- singlet::run_nmf(b_A[spliced_indices, ], rank = b_best_rank_spliced , L1 = 0, tol = 1e-5)
+b_us_nmf <- singlet::run_nmf(b_A[unspliced_indices, ], rank = b_best_rank_unspliced, L1 = 0, tol = 1e-5)
+b_sus_nmf <- singlet::run_nmf(b_combined_counts, rank = b_best_rank_added, L1 = 0, tol = 1e-5)
+b_concat_nmf <- singlet::run_nmf(b_A, rank = b_best_rank_concat, L1 = 0, tol = 1e-5)
+```
+
+
+
+```{r}
+save(
+  b_s_nmf, b_us_nmf, b_sus_nmf,b_concat_nmf,
+  file = "brain_nmf_final_models.RData"
+)
+
+```
+
+## PCA
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(irlba)      # for fast PCA
+library(ggplot2)
+library(dplyr)
+
+# --- Define helper for PCA + scree data ---
+get_pca_scree <- function(expr_matrix, label, n_pcs = 50) {
+  expr_matrix <- as.matrix(expr_matrix)
+  expr_matrix <- expr_matrix[Matrix::rowSums(expr_matrix) > 0, ]
+  expr_matrix <- t(scale(t(expr_matrix), center = TRUE, scale = TRUE))
+  
+  pca_res <- prcomp_irlba(expr_matrix, n = n_pcs, center = FALSE, scale. = FALSE)
+  var_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+  
+  data.frame(
+    PC = seq_along(var_explained),
+    VarianceExplained = var_explained,
+    Modality = label
+  )
+}
+
+# --- Run PCA on each modality ---
+b_scree_spliced <- get_pca_scree(b_A[spliced_indices, ], "spliced")
+b_scree_unspliced <- get_pca_scree(b_A[unspliced_indices, ], "unspliced")
+b_scree_concat <- get_pca_scree(b_A, "concat")
+b_scree_added <- get_pca_scree(b_combined_counts, "added")
+
+b_scree_df <- bind_rows(b_scree_spliced, b_scree_unspliced, b_scree_concat, b_scree_added)
+
+# --- Faceted PCA Scree Plot ---
+ggplot(b_scree_df, aes(x = PC, y = VarianceExplained)) +
+  geom_line(size = 1, color = "steelblue") +
+  geom_point(size = 1.5, color = "black") +
+  facet_wrap(~Modality, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "PCA Scree Plot by Modality",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+
+```
+
+
+```{r}
+save(
+  b_scree_df, b_scree_concat, b_scree_spliced,
+  b_scree_unspliced,b_scree_added,
+  file = "brain_PCA.RData"
+)
+```
+
+```{r}
+
+load("brain_PCA.RData")
+
+final_plot<- ggplot(b_scree_df, aes(x = PC, y = VarianceExplained, color = Modality)) +
+  geom_line(size = 0.8, alpha = 0.9) +
+  geom_point(size = 1.5, alpha = 0.9) +
+  scale_x_continuous(breaks = seq(0, 50, 10)) +
+  scale_y_continuous(expand = c(0.01, 0.01)) +
+  labs(
+    title = "PCA Scree Plot (Explained Variance by Component)",
+    subtitle = "Neuron Data",
+    x = "Principal Component",
+    y = "Explained Variance",
+    color = "Modality"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "#333333"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("brain_pca.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+
+```
+
+
+## Violin plot
+
+```{r}
+
+load("brain_nmf_final_models.RData")
+set.seed(123)
+b_s_nmf <- singlet::run_nmf(b_A[spliced_indices, ], rank = b_best_rank_spliced , L1 = 0, tol = 1e-5)
+b_us_nmf <- singlet::run_nmf(b_A[unspliced_indices, ], rank = b_best_rank_unspliced, L1 = 0, tol = 1e-5)
+b_sus_nmf <- singlet::run_nmf(b_A, rank = b_best_rank_concat, L1 = 0, tol = 1e-5)
+
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+
+spliced_indices <- grep("_s$", rownames(b_sus_nmf$w))
+unspliced_indices <- grep("_us$", rownames(b_sus_nmf$w))
+
+brain_scores <- data.frame(
+  nmf_factor = 1:ncol(b_sus_nmf$w),
+  spliced = colSums(b_sus_nmf$w[spliced_indices,]),
+  unspliced = colSums(b_sus_nmf$w[unspliced_indices,])
+)
+brain_scores$Dataset <- "Brain"
+
+p3 <- ggplot(brain_scores, aes(x = "factors", y = spliced)) + geom_violin() + geom_jitter(width = 0.1) + theme_classic() + 
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  theme(aspect.ratio = 2) + 
+  labs(y = "Proportion of Spliced Weights per Factor", x = "")
+
+
+ggsave("violin_brain.png", plot = p3, width = 6, height = 4, units = "in", dpi = 300, bg = "#ffffff")
+
+
+
+```
+
+
+## Fig 1
+
+```{r}
+
+load("brain_nmf_cv_results.RData")
+
+# label all individual cross-validation runs by group and rbind them
+b_df_sus <- b_cv_results_added
+b_df_s <- b_cv_results_spliced
+b_df_us <- b_cv_results_unspliced
+b_df_concat <- b_cv_results_concat
+
+b_df_sus$group    <- "Added"
+b_df_s$group      <- "Spliced Only"
+b_df_us$group     <- "Unspliced Only"
+b_df_concat$group <- "Concatenated"
+
+# Combine all into one dataframe
+b_df <- rbind(b_df_sus, b_df_s, b_df_us, b_df_concat)
+b_df$iter <- b_df$iter + 1
+
+# first generate a plot for Fig 1
+# Load plotting libraries
+library(ggplot2)
+library(viridis)
+
+# Set limits for y-axis
+lower_limit <- min(b_df$test_err) * 0.98
+upper_limit <- max(b_df$test_err[b_df$iter == 1])
+
+# Panel A: Test error vs. rank
+p1 <- ggplot(b_df, aes(x = k, y = test_err, color = iter, group = iter)) +
+  geom_line() +
+  scale_color_viridis_c(option = "B") +
+  theme_classic() +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Rank", color = "Epoch") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Panel B: Epoch trajectories for underfit, better fit, and overfit models
+plot_data <- subset(b_df, k == 5 | k == 30 | k == 80)
+plot_data$k <- factor(plot_data$k)
+levels(plot_data$k) <- c("Underfit (k = 5)", "Better Fit (k = 30)", "Overfit (k = 80)")
+
+p2 <- ggplot(plot_data, aes(x = iter, y = test_err, color = k, group = k)) +
+  geom_line(size = 0.5) +
+  theme_classic() +
+  scale_color_viridis_d(option = "B", end = 0.9, begin = 0.1) +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Epoch", color = "Rank")
+
+# Combine and save
+library(cowplot)
+final_plot <- plot_grid(p1, p2, labels = c("A", "B"), nrow = 2, align = "hv")
+ggsave("brain_cv_figure_with_concat.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+
+```
+
+## Heatmap
+
+```{r}
+
+load("brain_nmf_final_models.RData")
+library(RcppML)
+sus_nmf <- b_concat_nmf$w
+s_nmf <- b_s_nmf$w
+us_nmf <- b_us_nmf$w
+s_plus_us_nmf <- b_sus_nmf$w
+
+# combine them all!
+w <- cbind(sus_nmf[1:(nrow(sus_nmf)/2),], s_plus_us_nmf, s_nmf, us_nmf)
+modalities <- c(rep("concatenated", ncol(sus_nmf)),
+                rep("added", ncol(s_plus_us_nmf)),
+                rep("spliced", ncol(s_nmf)),
+                rep("unspliced", ncol(us_nmf)))
+
+# l2 norm on w
+
+w <- apply(w, 2, function(x) x / sqrt(sum(x^2)))
+G <- crossprod(w)
+# comparison between concatenated and unspliced needs to be modified
+G_adj <- RcppML::cosine(sus_nmf[(nrow(sus_nmf)/2 + 1): nrow(sus_nmf),], us_nmf)
+G[1:ncol(sus_nmf), (ncol(G) - ncol(us_nmf) + 1):ncol(G)] <- G_adj
+G[lower.tri(G)] <- t(G)[lower.tri(G)]
+
+# reorder based on bipartite matching against concatenated or added
+order <- c(
+  hclust(dist(t(G[,which(modalities == "concatenated")])))$order,
+  hclust(dist(t(G[,which(modalities == "added")])))$order + min(which(modalities == "added")) - 1,
+  hclust(dist(t(G[,which(modalities == "spliced")])))$order + min(which(modalities == "spliced")) - 1,
+  hclust(dist(t(G[,which(modalities == "unspliced")])))$order + min(which(modalities == "unspliced")) - 1)
+
+G <- G[order, order]
+G_ <- G
+rownames(G_) <- colnames(G_) <- 1:ncol(G_)
+colnames(G) <- rownames(G) <- modalities
+df <- reshape2::melt(G)
+df2 <- reshape2::melt(G_)
+plot_data <- data.frame("x" = df2$Var1, "y" = df2$Var2, "sim" = df2$value, "modality1" = df$Var1, "modality2" = df$Var2)
+
+p1 <- ggplot(plot_data, aes(x, y, fill = sim)) + geom_tile() + theme_classic() + scale_fill_viridis_c(option = "B", end = 0.9) + scale_y_continuous(expand = c(0.01, 0.01)) + scale_x_reverse(expand = c(0.01, 0.01)) + facet_grid(rows = vars(modality2), cols = vars(modality1), space = "free", scales = "free") + theme(axis.ticks = element_blank(), axis.text= element_blank()) + labs(fill = "Similarity", x = "NMF factors", y = "NMF factors") + theme(axis.line = element_blank())
+
+# box plot of 4-way comparison
+# y-axis per-factor cost of bipartite matching
+
+models <- list("concatenated" = sus_nmf[1:nrow(s_plus_us_nmf),], "added" = s_plus_us_nmf, "spliced" = s_nmf, "unspliced" = us_nmf)
+# concatenated model is truncated to spliced reads only
+# we will need to modify the pairing for unspliced to concatenated
+results <- list()
+for(i in 1:length(models)){
+  for(j in 1:length(models)){
+    if(i != j){
+      model1_name <- names(models)[[i]]
+      model2_name <- names(models)[[j]]
+      model1 <- apply(models[[i]], 2, function(x) x / sqrt(sum(x^2)))
+      model2 <- apply(models[[j]], 2, function(x) x / sqrt(sum(x^2)))
+      if(model1_name == "concatenated" && model2_name == "unspliced"){
+        model1 <- apply(sus_nmf[(nrow(sus_nmf)/2 + 1):nrow(sus_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      if(model2_name == "concatenated" && model1_name == "unspliced"){
+        model2 <- apply(sus_nmf[(nrow(sus_nmf)/2 + 1):nrow(sus_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      cost <- 1 - crossprod(model1, model2)
+      if(ncol(cost) < nrow(cost)) cost <- t(cost)
+      pairs <- bipartiteMatch(cost)$pairs
+      for(k in 1:length(pairs)){
+        pairs[[k]] <- cost[k, pairs[[k]]]
+      }
+      results[[length(results) + 1]] <- data.frame("model1" = model1_name, "model2" = model2_name, "cost" = pairs)
+    }
+  }
+}
+results <- do.call(rbind, results)
+
+p2 <- ggplot(results, aes(model1, cost, color = model2)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.1), size = 1) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  labs(x = "NMF Model Modality", 
+       y = "Cost of factor bipartite matching", 
+       color = "Matched Modality") + 
+  theme(aspect.ratio = 1.5) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+p3 <- cowplot::plot_grid(p1, p2, nrow = 1, rel_widths = c(1, 0.7), labels = c("A", "B"))
+ggsave("brain_figure_3.png", p3, width = 12, height = 6, units = "in", bg = "#ffffff", dpi = 300)
+
+
+```
+
+
+# PBMC Data
+
+
+```{r}
+# Load gene expression data (spliced and unspliced counts) and metadata
+folder <- "/mnt/home/jadharya/gene_files/raw_loom_10x_vc/pbmc_10k_v3_cr_extracted"
+
+spliced_counts   <- read_npz_into_R(file.path(folder, "pbmc_10k_v3_cr_spliced.npz"))
+unspliced_counts <- read_npz_into_R(file.path(folder, "pbmc_10k_v3_cr_unspliced.npz"))
+gene_data <- read.csv(file.path(folder, "pbmc_10k_v3_cr_genes.tsv"), sep = "\t", header = F)
+cell_data <- read.csv(file.path(folder, "pbmc_10k_v3_cr_barcodes.tsv"), sep = "\t", header = F)
+
+# Assign column and row names
+colnames(spliced_counts) <- colnames(unspliced_counts) <- as.character(cell_data[,1])
+rownames(spliced_counts) <- paste0(as.character(gene_data[,1]), "_s")
+rownames(unspliced_counts) <- paste0(as.character(gene_data[,1]), "_us")
+
+# Concatenate matrices and identify row indices
+A <- rbind(spliced_counts, unspliced_counts)
+spliced_indices <- 1:nrow(spliced_counts)
+unspliced_indices <- (nrow(spliced_counts) + 1):nrow(A)
+
+# basic QC to filter out low-quality cells
+p_A <- A[, which(colSums(A != 0) > 200 & colSums(A != 0) < 15000 & colSums(A) > 500 & colSums(A) < 75000)]
+
+# Custom log-normalization function (mimics Seurat::LogNormalize)
+log_normalize <- function(mat, scale_factor = 1e4) {
+  # Normalize each column to total counts per cell, then log-transform
+  norm_counts <- t(t(mat) / Matrix::colSums(mat)) * scale_factor
+  log1p(norm_counts)  # log1p = log(1 + x)
+}
+
+
+# standard log normalization
+p_A <- log_normalize(p_A)
+
+# Also prepare added (summed) version using *original matrices*, before renaming
+spliced_raw <- read_npz_into_R(file.path(folder, "heart_10k_v3_cr_spliced.npz"))
+unspliced_raw <- read_npz_into_R(file.path(folder, "heart_10k_v3_cr_unspliced.npz"))
+rownames(spliced_raw) <- rownames(unspliced_raw) <- as.character(gene_data[, 1])
+colnames(spliced_raw) <- colnames(unspliced_raw) <- as.character(cell_data[, 1])
+
+# Use same cells (columns) that passed QC above
+shared_cells <- colnames(p_A)
+spliced_raw <- spliced_raw[, shared_cells]
+unspliced_raw <- unspliced_raw[, shared_cells]
+
+# Add spliced + unspliced (gene-wise) to create added modality
+p_combined_counts <- spliced_raw + unspliced_raw
+
+# Remove duplicate gene names (keep first occurrence)
+p_combined_counts <- p_combined_counts[!duplicated(rownames(p_combined_counts)), ]
+
+# Sanity check to ensure no duplicated gene names remain
+stopifnot(length(unique(rownames(p_combined_counts))) == nrow(p_combined_counts))
+
+
+num_dups <- sum(duplicated(rownames(p_combined_counts)))
+cat("Removed", num_dups, "duplicated gene names from combined_counts\n")
+
+
+p_combined_counts <- log_normalize(p_combined_counts)
+
+
+```
+
+
+```{r}
+# Save processed matrices and index vectors for reuse
+save(
+  p_A,
+  spliced_indices,
+  unspliced_indices,
+  p_combined_counts,
+  file = "pbmc_log_normalized_data.RData"
+)
+
+```
+
+```{r}
+load("pbmc_log_normalized_data.RData")
+
+```
+
+# Cross-validation of data
+
+```{r}
+# devtools::install_github("zdebruine/singlet")
+library(singlet)
+
+cross_val <- function(A, ranks = 2:80){
+  cv_data <- singlet::cross_validate_nmf(A, ranks,
+                                         n_replicates = 1,
+                                         trace_test_mse = 1,
+                                         maxit = 50, tol = -1, tol_overfit = Inf)
+  cv_data <- aggregate(cv_data$test_error, by = list(cv_data$k, cv_data$iter), FUN = mean)
+  colnames(cv_data) <- c("k", "iter", "test_err")
+  return(cv_data)
+}
+
+get_best_rank <- function(cv_data){
+  unique(cv_data$k)[which.min(sapply(unique(cv_data$k), function(x) {
+    tail(cv_data[cv_data$k == x, "test_err"], n = 1L)
+  }))]
+}
+```
+
+```{r}
+# Run cross-validation for all modalities (concatenated, spliced-only, unspliced-only, added)
+set.seed(43)
+p_cv_results_concat <- cross_val(p_A, ranks = 2:80)
+p_best_rank_concat <- get_best_rank(p_cv_results_concat)
+p_cv_results_spliced <- cross_val(p_A[spliced_indices, ], ranks = 2:80)
+p_best_rank_spliced <- get_best_rank(p_cv_results_spliced)
+p_cv_results_unspliced <- cross_val(p_A[unspliced_indices, ], ranks = 2:80)
+p_best_rank_unspliced <- get_best_rank(p_cv_results_unspliced)
+p_cv_results_added <- cross_val(p_combined_counts, ranks = 2:80)
+p_best_rank_added <- get_best_rank(p_cv_results_added)
+```
+
+```{r}
+
+# Save all cross-validation results for later use
+save(
+  p_A,
+  p_cv_results_spliced,
+  p_best_rank_spliced,
+  p_cv_results_unspliced,
+  p_best_rank_unspliced,
+  p_cv_results_concat,
+  p_best_rank_concat,
+  p_cv_results_added,
+  p_best_rank_added,
+  file = "pbmc_nmf_cv_results.RData"
+)
+
+```
+
+```{r}
+
+load("pbmc_nmf_cv_results.RData")
+# Output best ranks selected for each modality
+p_best_rank_concat
+p_best_rank_spliced
+p_best_rank_unspliced
+p_best_rank_added
+
+```
+
+```{r}
+# Run cross-validation again with different seeds to assess stability
+set.seed(44)
+
+p_cv_results_concat2 <- cross_val(p_A, ranks = 2:80)
+p_best_rank_concat2 <- get_best_rank(p_cv_results_concat2)
+p_cv_results_spliced2 <- cross_val(p_A[spliced_indices, ], ranks = 2:80)
+p_best_rank_spliced2 <- get_best_rank(p_cv_results_spliced2)
+p_cv_results_unspliced2 <- cross_val(p_A[unspliced_indices, ], ranks = 2:80)
+p_best_rank_unspliced2 <- get_best_rank(p_cv_results_unspliced2)
+p_cv_results_added2 <- cross_val(p_combined_counts, ranks = 2:80)
+p_best_rank_added2 <- get_best_rank(p_cv_results_added2)
+
+```
+
+```{r}
+
+# Save second set of CV results
+save(
+  p_cv_results_spliced2,
+  p_best_rank_spliced2,
+  p_cv_results_unspliced2,
+  p_best_rank_unspliced2,
+  p_cv_results_concat2,
+  p_best_rank_concat2,
+  p_cv_results_added2,
+  p_best_rank_added2,
+  file = "pbmc_nmf_cv_results2.RData"
+)
+
+```
+
+```{r}
+
+load("pbmc_nmf_cv_results2.RData")
+
+```
+
+
+```{r}
+# Run third round of cross-validation for robustness
+set.seed(45)
+p_cv_results_concat3 <- cross_val(p_A, ranks = 2:80)
+p_best_rank_concat3 <- get_best_rank(p_cv_results_concat3)
+p_cv_results_spliced3 <- cross_val(p_A[spliced_indices, ], ranks = 2:80)
+p_best_rank_spliced3 <- get_best_rank(p_cv_results_spliced3)
+p_cv_results_unspliced3 <- cross_val(p_A[unspliced_indices, ], ranks = 2:80)
+p_best_rank_unspliced3 <- get_best_rank(p_cv_results_unspliced3)
+p_cv_results_added3 <- cross_val(p_combined_counts, ranks = 2:80)
+p_best_rank_added3 <- get_best_rank(p_cv_results_added3)
+
+```
+
+```{r}
+
+# Save third set of CV results
+save(
+  p_cv_results_spliced3,
+  p_best_rank_spliced3,
+  p_cv_results_unspliced3,
+  p_best_rank_unspliced3,
+  p_cv_results_concat3,
+  p_best_rank_concat3,
+  p_cv_results_added3,
+  p_best_rank_added3,
+  file = "pbmc_nmf_cv_results3.RData"
+)
+
+```
+
+```{r}
+load("pbmc_nmf_cv_results3.RData")
+
+```
+
+
+```{r}
+# Combine all 3 replicate results into lists for grouped analysis
+p_concat_cv <- list(p_cv_results_concat, p_cv_results_concat2, p_cv_results_concat3)
+p_spliced_cv  <- list(p_cv_results_spliced, p_cv_results_spliced2, p_cv_results_spliced3)
+p_unspliced_cv <- list(p_cv_results_unspliced, p_cv_results_unspliced2, p_cv_results_unspliced3)
+p_added_cv <- list(p_cv_results_added,p_cv_results_added2, p_cv_results_added3)
+
+```
+
+```{r}
+# Save grouped CV data
+save(
+  p_concat_cv, p_spliced_cv, p_unspliced_cv,p_added_cv,
+  file = "pbmc_rank_sweep_results.RData"
+)
+
+```
+
+```{r}
+load("pbmc_rank_sweep_results.RData")
+
+```
+
+
+## CV figure by seeds
+```{r}
+label_cv_df <- function(cv_list, source_label) {
+  dplyr::bind_rows(lapply(seq_along(cv_list), function(i) {
+    df <- cv_list[[i]]
+    df$replicate <- i
+    df$source <- source_label
+    return(df)
+  }))
+}
+
+# Label and combine CV results
+p_cv_concat_all <- label_cv_df(p_concat_cv, "Concat") %>% mutate(seed = replicate)
+p_cv_spliced_all  <- label_cv_df(p_spliced_cv, "Spliced") %>% mutate(seed = replicate)
+p_cv_unspliced_all <- label_cv_df(p_unspliced_cv, "Unspliced") %>% mutate(seed = replicate)
+p_cv_added_all <- label_cv_df(p_added_cv, "Added") %>% mutate(seed = replicate)
+
+# Combine all into one data frame
+p_cv_all <- bind_rows(p_cv_concat_all,p_cv_spliced_all, p_cv_unspliced_all,p_cv_added_all)
+
+# Order factor levels for consistent plotting
+p_cv_all$source <- factor(p_cv_all$source, levels = c("Concat", "Spliced", "Unspliced", "Added"))
+
+# Summary statistics per seed, source, and rank
+p_cv_all_summary <- p_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(
+    mean_err = mean(test_err),
+    sd_err = sd(test_err),
+    .groups = "drop"
+  )
+
+# Best k per seed and source
+p_best_k_by_seed <- p_cv_all %>%
+  group_by(seed, source, k) %>%
+  summarise(mean_err = mean(test_err), .groups = "drop") %>%
+  group_by(seed, source) %>%
+  slice_min(mean_err, n = 1) %>%
+  rename(best_k = k)
+
+```
+
+
+```{r}
+
+# Plot
+#This plot shows the mean test error ± standard deviation across different ranks (k) for each modality (Concat, Spliced, Unspliced, Added) across 3 random seeds.
+
+fig3 <- ggplot(p_cv_all_summary, aes(x = k, y = mean_err, color = source, fill = source)) +
+  geom_line(size = 1) +
+  geom_vline(data = p_best_k_by_seed, aes(xintercept = best_k), linetype = "dashed", color = "black") +
+  geom_text(
+    data = p_best_k_by_seed,
+    aes(x = best_k, y = Inf, label = paste0("k=", best_k)),
+    vjust = -0.5, hjust = 0, angle = 90, size = 3, color = "black", inherit.aes = FALSE
+  ) +
+  #geom_ribbon(aes(ymin = mean_err - sd_err, ymax = mean_err + sd_err), alpha = 0.2, color = NA) +
+  facet_grid(seed ~ source, scales = "fixed") +
+  labs(
+    title = "PBMC NMF CV Error by Rank and Seed",
+    subtitle = "Mean ± SD for each modality and seed",
+    x = "Rank (k)", y = "Test Error"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+ggsave("new_cv_error_byseed_pbmc.png", plot = fig3, width = 12.5, height = 5.5, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+```{r}
+p_cv_all <- p_cv_all %>% rename(epoch = iter)
+
+
+panel_a <- ggplot(p_cv_all, aes(x = k, y = test_err, group = epoch, color = epoch)) +
+  geom_line(size = 0.3, alpha = 0.9) +
+  facet_grid(seed ~ source) +
+  scale_color_viridis_c(name = "Epoch", direction = -1) +
+  labs(
+    x = "NMF Model Rank",
+    y = "Test Set Loss",
+    title = "A"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+selected_ranks <- c(5, 30, 80)
+rank_labels <- c("5" = "Underfit (k = 5)", "30" = "Better Fit (k = 30)", "80" = "Overfit (k = 80)")
+
+p_cv_subset <- p_cv_all %>% filter(k %in% selected_ranks)
+
+panel_b <- ggplot(p_cv_subset, aes(x = epoch, y = test_err, color = factor(k))) +
+  geom_line(size = 1) +
+  facet_grid(seed ~ source) +
+  scale_color_manual(
+    name = "Rank",
+    values = c("5" = "black", "30" = "red", "80" = "gold"),
+    labels = rank_labels
+  ) +
+  labs(
+    x = "NMF Model Epoch",
+    y = "Test Set Loss",
+    title = "B"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+
+library(cowplot)
+# plot to show Test error over epochs for all ranks
+
+final_cv_figure <- plot_grid(panel_a, panel_b, ncol = 1, labels = NULL, rel_heights = c(1.2, 1))
+
+p_final_cv_figure_titled <- plot_grid(
+  ggdraw() + 
+    draw_label("CV Error Trajectories by Epoch and Rank for PBMC Dataset", 
+               fontface = 'bold', 
+               x = 0.5, 
+               hjust = 0.5, 
+               size = 16), 
+  final_cv_figure, 
+  ncol = 1, 
+  rel_heights = c(0.1, 1)  # Make room for the title
+)
+
+ggsave("pbmc_cv_figure_by_seeds.png", final_cv_figure,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+ggsave("pbmc_cv_by_seeds_and_epochs.png", final_cv_figure_titled,
+       width = 13, height = 9, units = "in", dpi = 300, bg = "#ffffff")
+
+```
+
+
+
+```{r}
+set.seed(123)
+p_s_nmf <- singlet::run_nmf(p_A[spliced_indices, ], rank = p_best_rank_spliced , L1 = 0, tol = 1e-5)
+p_us_nmf <- singlet::run_nmf(p_A[unspliced_indices, ], rank = p_best_rank_unspliced, L1 = 0, tol = 1e-5)
+p_sus_nmf <- singlet::run_nmf(p_combined_counts, rank = p_best_rank_added, L1 = 0, tol = 1e-5)
+p_concat_nmf <- singlet::run_nmf(p_A, rank = p_best_rank_concat, L1 = 0, tol = 1e-5)
+```
+
+
+```{r}
+save(
+  p_s_nmf, p_us_nmf, p_sus_nmf,p_concat_nmf,
+  file = "pbmc_nmf_final_models.RData"
+)
+
+```
+
+## PCA
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(irlba)      # for fast PCA
+library(ggplot2)
+library(dplyr)
+
+# --- Define helper for PCA + scree data ---
+get_pca_scree <- function(expr_matrix, label, n_pcs = 50) {
+  expr_matrix <- as.matrix(expr_matrix)
+  expr_matrix <- expr_matrix[Matrix::rowSums(expr_matrix) > 0, ]
+  expr_matrix <- t(scale(t(expr_matrix), center = TRUE, scale = TRUE))
+  
+  pca_res <- prcomp_irlba(expr_matrix, n = n_pcs, center = FALSE, scale. = FALSE)
+  var_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+  
+  data.frame(
+    PC = seq_along(var_explained),
+    VarianceExplained = var_explained,
+    Modality = label
+  )
+}
+
+# --- Run PCA on each modality ---
+p_scree_spliced <- get_pca_scree(p_A[spliced_indices, ], "spliced")
+p_scree_unspliced <- get_pca_scree(p_A[unspliced_indices, ], "unspliced")
+p_scree_concat <- get_pca_scree(p_A, "concat")
+p_scree_added <- get_pca_scree(p_combined_counts, "added")
+
+p_scree_df <- bind_rows(p_scree_spliced, p_scree_unspliced, p_scree_concat, p_scree_added)
+
+# --- Faceted PCA Scree Plot ---
+ggplot(p_scree_df, aes(x = PC, y = VarianceExplained)) +
+  geom_line(size = 1, color = "steelblue") +
+  geom_point(size = 1.5, color = "black") +
+  facet_wrap(~Modality, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "PCA Scree Plot by Modality",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+
+```
+
+
+```{r}
+save(
+  p_scree_df, p_scree_concat, p_scree_spliced,
+  p_scree_unspliced,p_scree_added,
+  file = "pbmc_PCA.RData"
+)
+```
+
+```{r}
+
+load("pbmc_PCA.RData")
+
+final_plot<- ggplot(p_scree_df, aes(x = PC, y = VarianceExplained, color = Modality)) +
+  geom_line(size = 0.8, alpha = 0.9) +
+  geom_point(size = 1.5, alpha = 0.9) +
+  scale_x_continuous(breaks = seq(0, 50, 10)) +
+  scale_y_continuous(expand = c(0.01, 0.01)) +
+  labs(
+    title = "PCA Scree Plot (Explained Variance by Component)",
+    subtitle = "Neuron Data",
+    x = "Principal Component",
+    y = "Explained Variance",
+    color = "Modality"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "#333333"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("pbmc_pca.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+
+```
+
+
+## GSEA
+
+```{r}
+load("pbmc_nmf_final_models.RData")
+set.seed(123)
+p_s_nmf <- singlet::run_nmf(p_A[spliced_indices, ], rank = p_best_rank_spliced , L1 = 0, tol = 1e-5)
+p_us_nmf <- singlet::run_nmf(p_A[unspliced_indices, ], rank = p_best_rank_unspliced, L1 = 0, tol = 1e-5)
+p_concat_nmf <- singlet::run_nmf(p_A, rank = p_best_rank_concat, L1 = 0, tol = 1e-5)
+
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+
+spliced_indices <- grep("_s$", rownames(p_concat_nmf$w))
+unspliced_indices <- grep("_us$", rownames(p_concat_nmf$w))
+
+raw_scores <- data.frame(
+  nmf_factor = 1:ncol(p_concat_nmf$w),
+  spliced = colSums(p_concat_nmf$w[spliced_indices,]),
+  unspliced = colSums(p_concat_nmf$w[unspliced_indices,])
+)
+
+p1 <- ggplot(raw_scores, aes(x = "factors", y = spliced)) + geom_violin() + geom_jitter(width = 0.1) + theme_classic() + 
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  theme(aspect.ratio = 2) + 
+  labs(y = "Proportion of Spliced Weights per Factor", x = "")
+
+top_spliced_factor   <- raw_scores$nmf_factor[which.max(raw_scores$spliced)]
+top_unspliced_factor <- raw_scores$nmf_factor[which.max(raw_scores$unspliced)]
+top_combined_factor  <- raw_scores$nmf_factor[which.min(abs(raw_scores$spliced - 0.5))]
+
+# Clean gene IDs
+
+# function to run GSEA for a single factor index
+run_gsea_fgsea <- function(gene_weights, species = "Homo sapiens", cutoff_percentile = 0.8) {
+  names(gene_weights) <- gsub("_s", "", gsub("_us", "", names(gene_weights)))
+  gene_weights <- gene_weights[gene_weights > 0]
+  cutoff_weight <- gene_weights[order(gene_weights, decreasing = TRUE)[length(gene_weights) * (1 - cutoff_percentile)]]
+  gene_weights <- gene_weights[gene_weights > cutoff_weight]
+  set.seed(123)
+  gene_weights <- sort(gene_weights, decreasing = TRUE)
+
+  gene_sets <- msigdbr(species = species, collection = "C5") %>%
+    dplyr::select(gs_name, gene_symbol) %>%
+    split(x = .$gene_symbol, f = .$gs_name)
+  
+  fgsea_res <- fgseaMultilevel(
+    pathways = gene_sets,
+    stats = gene_weights,
+    minSize = 5,
+    maxSize = 250,
+    eps = 0,
+    scoreType = "pos"
+  )
+  
+  top_pathways <- collapsePathways(
+    fgsea_res, gene_sets, gene_weights, pval.threshold = 0.05, nperm = 200, gseaParam = 1)$mainPathways
+  
+  result <- data.frame("pathway" = fgsea_res$pathway, "padj" = fgsea_res$padj, "NES" = fgsea_res$NES, "is_top_pathway" = fgsea_res$pathway %in% top_pathways, "size" = fgsea_res$size)
+}
+
+# run GSEA on all factors for spliced and unspliced
+gsea_results <- list()
+cat("running fgsea on factor: ")
+for(i in 1:ncol(p_concat_nmf$w)){
+  # this loop can take a long time
+  cat(i, " ")
+  gsea_res_s <- run_gsea_fgsea(p_concat_nmf$w[spliced_indices, i])
+  gsea_res_us <- run_gsea_fgsea(p_concat_nmf$w[unspliced_indices, i])
+  gsea_results[[i]] <- list("spliced" = gsea_res_s, "unspliced" = gsea_res_us)
+}
+
+# plot out GO term enrichment in spliced vs. unspliced factors, colored by p-value
+df <- lapply(gsea_results, function(x){
+  x <- merge(x$spliced, x$unspliced, by = "row.names", all = TRUE)
+  x$padj.max <- pmax(x$padj.x, x$padj.y)
+  x
+})
+df <- do.call(rbind, df)
+
+p2 <- ggplot(df, aes(-log10(padj.x), -log10(padj.y))) + geom_point(size = 0.3, alpha = 0.5) + theme_classic() + labs(x = "padj (spliced)", y = "padj (unspliced)") + scale_y_continuous(expand = c(0, 0), limits = c(0, 20)) + scale_x_continuous(expand = c(0, 0), limits = c(0, 20)) + theme(aspect.ratio = 1) + geom_vline(xintercept = 2, linetype = "dashed", color = "grey") + geom_hline(yintercept = 2, linetype = "dashed", color = "grey")
+
+plot_gsea_velocity <- function(gsea_results, factor_pos = 1, pathways_per_panel = 5, subset_collapsed_pathways = FALSE){
+  gsea_s <- gsea_results[[factor_pos]]$spliced
+  gsea_us <- gsea_results[[factor_pos]]$unspliced
+  rownames(gsea_s) <- gsea_s$pathway
+  rownames(gsea_us) <- gsea_us$pathway
+  gsea_s$pathway <- NULL
+  gsea_us$pathway <- NULL
+  plot_data <- merge(gsea_s, gsea_us, by = "row.names", all = TRUE)
+  plot_data <- data.frame("pathway" = plot_data$Row.names, 
+                          "padj_s" = plot_data$padj.x, 
+                          "padj_us" = plot_data$padj.y,
+                          "is_top_pathway_s" = plot_data$is_top_pathway.x,
+                          "is_top_pathway_us" = plot_data$is_top_pathway.y,
+                          "NES_s" = plot_data$NES.x,
+                          "NES_us" = plot_data$NES.y)
+  plot_data$padj_s[is.na(plot_data$padj_s)] <- 1
+  plot_data$padj_us[is.na(plot_data$padj_us)] <- 1
+  plot_data$NES_s[is.na(plot_data$NES_s)] <- 1
+  plot_data$NES_us[is.na(plot_data$NES_us)] <- 1
+  plot_data$is_top_pathway_s[is.na(plot_data$is_top_pathway_s)] <- FALSE
+  plot_data$is_top_pathway_us[is.na(plot_data$is_top_pathway_us)] <- FALSE
+  plot_data$is_top_pathway <- plot_data$is_top_pathway_s | plot_data$is_top_pathway_us
+  plot_data$is_top_pathway_s <- plot_data$is_top_pathway_us <- NULL
+  
+  # subset to only pathways that are significantly enriched in at least one of s or us (p < 0.01)
+  plot_data <- subset(plot_data, padj_us < 0.05 | padj_s < 0.05)
+  
+  fc <- 2 * (plot_data$NES_us - plot_data$NES_s) / (plot_data$NES_us + plot_data$NES_s)
+  fc_us <- 2 * (plot_data$NES_s - plot_data$NES_us) / (plot_data$NES_us + plot_data$NES_s)
+  for(i in 1:length(fc_us)){
+    if(fc_us[[i]] > fc[[i]]) fc[[i]] <- -fc_us[[i]]
+  }
+  plot_data$NES_fc <- fc
+  
+  fold_change <- function(x, y){
+    ifelse(x > y, (x - y) / (x + y), -(y - x) / (x + y))
+  }
+  
+  plot_data$padj_fc <- fold_change(-log10(plot_data$padj_us), -log10(plot_data$padj_s))
+  plot_data$NES_fc <- fold_change(plot_data$NES_us, plot_data$NES_s)
+  
+  plot_data$NES_max <- pmax(plot_data$NES_us, plot_data$NES_s)
+  plot_data$padj_max <- pmax(-log10(plot_data$padj_us), -log10(plot_data$padj_s))
+
+  plot_data$label <- plot_data$pathway
+  plot_data$label[!plot_data$is_top_pathway] <- ""
+  plot_data <- plot_data[grep("GOBP_", plot_data$pathway),]
+  plot_data$label <- plot_data$pathway <- gsub("GOBP_", "", plot_data$pathway)
+  
+  # OPTIONAL: reduce to collapsed pathways
+  if(subset_collapsed_pathways) plot_data <- subset(plot_data, is_top_pathway)
+  
+  # facet grid by "most spliced", "most unspliced", "most shared"
+  plot_data <- plot_data[order(plot_data$NES_fc, decreasing = TRUE), ]
+  plot_data <- plot_data[, c("pathway", "padj_s", "padj_us", "NES_s", "NES_us", "is_top_pathway", "NES_fc")]
+  plot_data$group <- NA
+  plot_data$group[1:pathways_per_panel] <- "most unspliced"
+  plot_data$group[(nrow(plot_data) - pathways_per_panel + 1):nrow(plot_data)] <- "most spliced"
+  plot_data$group[order(abs(plot_data$NES_fc), decreasing = FALSE)[1:5]] <- "most shared"
+  plot_data <- plot_data[!is.na(plot_data$group), ]
+  p1 <- plot_data[, c("pathway", "padj_s", "NES_s", "group", "is_top_pathway", "NES_fc")]
+  p2 <- plot_data[, c("pathway", "padj_us", "NES_us", "group", "is_top_pathway", "NES_fc")]
+  p1$mode <- "spliced"
+  p2$mode <- "unspliced"
+  colnames(p1) <- colnames(p2) <- c("pathway", "padj", "NES", "group", "is_top_pathway", "NES_fc", "mode")
+  plot_data <- rbind(p1, p2)
+  plot_data$mode <- factor(plot_data$mode)
+  plot_data$pathway <- sapply(as.character(plot_data$pathway), function(x) ifelse(nchar(x) > 50, paste0(substr(x, 1, 50), "..."), x))
+  plot_data$pathway <- factor(plot_data$pathway, levels = unique(plot_data$pathway))
+  plot_data$group <- factor(plot_data$group)
+  ggplot(subset(plot_data, !is.na(group)), aes(NES, pathway, color = mode, size = -log10(padj))) + geom_point(alpha = 0.9) + scale_size_continuous() + theme_classic() + theme(axis.text.y = element_text(size = 7)) + theme(aspect.ratio = 1) + facet_grid(rows = vars(group), scales = "free_y") +
+    scale_x_continuous(limits = c(0, 3), expand = c(0, 0))
+}
+
+p3 <- plot_gsea_velocity(gsea_results, factor_pos = 9) + ggtitle("Factor 9") + theme(plot.title = element_text(hjust = 0.5))
+p4 <- plot_gsea_velocity(gsea_results, factor_pos = 28) + ggtitle("Factor 28") + theme(plot.title = element_text(hjust = 0.5))
+
+library(cowplot)
+fig1 <- plot_grid(p1 + theme(aspect.ratio = 3), p2, nrow = 1, labels = c("A", "B"), rel_widths = c(1, 2))
+ggsave("violin_PBMC.png", plot = fig1, width = 6, height = 4, units = "in", dpi = 300, bg = "#ffffff")
+
+fig2 <- plot_grid(p3 + theme(legend.position = "none"), p4 + theme(legend.position = "none"), get_legend(p3), labels = c("A", "B", ""), rel_widths = c(1, 1, 0.3), nrow = 1)
+ggsave("gsea_PBMC.png", plot = fig2, width = 12.5, height = 5.5, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+## Violin Plot
+
+```{r}
+
+
+load("pbmc_nmf_final_models.RData")
+set.seed(123)
+p_s_nmf <- singlet::run_nmf(p_A[spliced_indices, ], rank = p_best_rank_spliced , L1 = 0, tol = 1e-5)
+p_us_nmf <- singlet::run_nmf(p_A[unspliced_indices, ], rank =p_best_rank_unspliced, L1 = 0, tol = 1e-5)
+p_concat_nmf <- singlet::run_nmf(p_A, rank = p_best_rank_concat, L1 = 0, tol = 1e-5)
+
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+
+spliced_indices <- grep("_s$", rownames(p_concat_nmf$w))
+unspliced_indices <- grep("_us$", rownames(p_concat_nmf$w))
+
+pbmc_scores <- data.frame(
+  nmf_factor = 1:ncol(p_concat_nmf$w),
+  spliced = colSums(p_concat_nmf$w[spliced_indices,]),
+  unspliced = colSums(p_concat_nmf$w[unspliced_indices,])
+)
+pbmc_scores$Dataset <- "PBMC"
+
+p4 <- ggplot(pbmc_scores, aes(x = "factors", y = spliced)) + geom_violin() + geom_jitter(width = 0.1) + theme_classic() + 
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  theme(aspect.ratio = 2) + 
+  labs(y = "Proportion of Spliced Weights per Factor", x = "")
+
+
+library(cowplot)
+#fig1 <- plot_grid(p1 + theme(aspect.ratio = 3), p2, nrow = 1, labels = c("A", "B"), rel_widths = c(1, 2))
+ggsave("violin_pbmc.png", plot = p4, width = 6, height = 4, units = "in", dpi = 300, bg = "#ffffff")
+
+
+```
+
+## GSEA on all factors
+```{r}
+load("pbmc_nmf_final_models_and_clusters.RData")
+set.seed(123)
+p_s_nmf <- singlet::run_nmf(p_A[spliced_indices, ], rank = p_best_rank_spliced , L1 = 0, tol = 1e-5)
+p_us_nmf <- singlet::run_nmf(p_A[unspliced_indices, ], rank = p_best_rank_unspliced, L1 = 0, tol = 1e-5)
+p_concat_nmf <- singlet::run_nmf(p_A, rank = p_best_rank_concat, L1 = 0, tol = 1e-5)
+
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+
+spliced_indices <- grep("_s$", rownames(p_concat_nmf$w))
+unspliced_indices <- grep("_us$", rownames(p_concat_nmf$w))
+
+raw_scores <- data.frame(
+  nmf_factor = 1:ncol(p_concat_nmf$w),
+  spliced = colSums(p_concat_nmf$w[spliced_indices,]),
+  unspliced = colSums(p_concat_nmf$w[unspliced_indices,])
+)
+
+p1 <- ggplot(raw_scores, aes(x = "factors", y = spliced)) + geom_violin() + geom_jitter(width = 0.1) + theme_classic() + 
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  theme(aspect.ratio = 2) + 
+  labs(y = "sum of spliced/unspliced weights", x = "")
+
+top_spliced_factor   <- raw_scores$nmf_factor[which.max(raw_scores$spliced)]
+top_unspliced_factor <- raw_scores$nmf_factor[which.max(raw_scores$unspliced)]
+top_combined_factor  <- raw_scores$nmf_factor[which.min(abs(raw_scores$spliced - 0.5))]
+
+# Clean gene IDs
+
+# function to run GSEA for a single factor index
+run_gsea_fgsea <- function(gene_weights, species = "Homo sapiens", cutoff_percentile = 0.8) {
+  names(gene_weights) <- gsub("_s", "", gsub("_us", "", names(gene_weights)))
+  gene_weights <- gene_weights[gene_weights > 0]
+  cutoff_weight <- gene_weights[order(gene_weights, decreasing = TRUE)[length(gene_weights) * (1 - cutoff_percentile)]]
+  gene_weights <- gene_weights[gene_weights > cutoff_weight]
+  set.seed(123)
+  gene_weights <- sort(gene_weights, decreasing = TRUE)
+
+  gene_sets <- msigdbr(species = species, collection = "C5") %>%
+    dplyr::select(gs_name, gene_symbol) %>%
+    split(x = .$gene_symbol, f = .$gs_name)
+  
+  fgsea_res <- fgseaMultilevel(
+    pathways = gene_sets,
+    stats = gene_weights,
+    minSize = 5,
+    maxSize = 250,
+    eps = 0,
+    scoreType = "pos"
+  )
+  
+  top_pathways <- collapsePathways(
+    fgsea_res, gene_sets, gene_weights, pval.threshold = 0.05, nperm = 200, gseaParam = 1)$mainPathways
+  
+  result <- data.frame("pathway" = fgsea_res$pathway, "padj" = fgsea_res$padj, "NES" = fgsea_res$NES, "is_top_pathway" = fgsea_res$pathway %in% top_pathways, "size" = fgsea_res$size)
+}
+
+# run GSEA on all factors for spliced and unspliced
+gsea_results <- list()
+cat("running fgsea on factor: ")
+for(i in 1:ncol(p_concat_nmf$w)){
+  # this loop can take a long time
+  cat(i, " ")
+  gsea_res_s <- run_gsea_fgsea(p_concat_nmf$w[spliced_indices, i])
+  gsea_res_us <- run_gsea_fgsea(p_concat_nmf$w[unspliced_indices, i])
+  gsea_results[[i]] <- list("spliced" = gsea_res_s, "unspliced" = gsea_res_us)
+}
+
+# plot out GO term enrichment in spliced vs. unspliced factors, colored by p-value
+df <- lapply(gsea_results, function(x){
+  x <- merge(x$spliced, x$unspliced, by = "row.names", all = TRUE)
+  x$padj.max <- pmax(x$padj.x, x$padj.y)
+  x
+})
+df <- do.call(rbind, df)
+
+p2 <- ggplot(df, aes(-log10(padj.x), -log10(padj.y))) + geom_point(size = 0.3, alpha = 0.5) + theme_classic() + labs(x = "padj (spliced)", y = "padj (unspliced)") + scale_y_continuous(expand = c(0, 0), limits = c(0, 20)) + scale_x_continuous(expand = c(0, 0), limits = c(0, 20)) + theme(aspect.ratio = 1) + geom_vline(xintercept = 2, linetype = "dashed", color = "grey") + geom_hline(yintercept = 2, linetype = "dashed", color = "grey")
+
+plot_gsea_velocity <- function(gsea_results, factor_pos = 1, pathways_per_panel = 5, subset_collapsed_pathways = FALSE) {
+  gsea_s <- gsea_results[[factor_pos]]$spliced
+  gsea_us <- gsea_results[[factor_pos]]$unspliced
+  rownames(gsea_s) <- gsea_s$pathway
+  rownames(gsea_us) <- gsea_us$pathway
+  gsea_s$pathway <- NULL
+  gsea_us$pathway <- NULL
+  plot_data <- merge(gsea_s, gsea_us, by = "row.names", all = TRUE)
+  
+  plot_data <- data.frame(
+    "pathway" = plot_data$Row.names, 
+    "padj_s" = plot_data$padj.x, 
+    "padj_us" = plot_data$padj.y,
+    "is_top_pathway_s" = plot_data$is_top_pathway.x,
+    "is_top_pathway_us" = plot_data$is_top_pathway.y,
+    "NES_s" = plot_data$NES.x,
+    "NES_us" = plot_data$NES.y
+  )
+  
+  plot_data$padj_s[is.na(plot_data$padj_s)] <- 1
+  plot_data$padj_us[is.na(plot_data$padj_us)] <- 1
+  plot_data$NES_s[is.na(plot_data$NES_s)] <- 1
+  plot_data$NES_us[is.na(plot_data$NES_us)] <- 1
+  plot_data$is_top_pathway_s[is.na(plot_data$is_top_pathway_s)] <- FALSE
+  plot_data$is_top_pathway_us[is.na(plot_data$is_top_pathway_us)] <- FALSE
+  plot_data$is_top_pathway <- plot_data$is_top_pathway_s | plot_data$is_top_pathway_us
+  plot_data$is_top_pathway_s <- plot_data$is_top_pathway_us <- NULL
+  
+  # subset to only pathways that are significantly enriched in at least one of s or us (p < 0.05)
+  plot_data <- subset(plot_data, padj_us < 0.05 | padj_s < 0.05)
+  
+  # Compute NES fold changes
+  fold_change <- function(x, y) {
+    ifelse(x > y, (x - y) / (x + y), -(y - x) / (x + y))
+  }
+  
+  plot_data$padj_fc <- fold_change(-log10(plot_data$padj_us), -log10(plot_data$padj_s))
+  plot_data$NES_fc <- fold_change(plot_data$NES_us, plot_data$NES_s)
+  
+  plot_data$NES_max <- pmax(plot_data$NES_us, plot_data$NES_s)
+  plot_data$padj_max <- pmax(-log10(plot_data$padj_us), -log10(plot_data$padj_s))
+
+  plot_data$label <- plot_data$pathway
+  plot_data$label[!plot_data$is_top_pathway] <- ""
+  plot_data <- plot_data[grep("GOBP_", plot_data$pathway), ]
+  plot_data$label <- plot_data$pathway <- gsub("GOBP_", "", plot_data$pathway)
+
+  # OPTIONAL: reduce to collapsed pathways
+  if (subset_collapsed_pathways) {
+    plot_data <- subset(plot_data, is_top_pathway)
+  }
+
+  # Safe group assignment block
+  plot_data <- plot_data[order(plot_data$NES_fc, decreasing = TRUE), ]
+  plot_data <- plot_data[, c("pathway", "padj_s", "padj_us", "NES_s", "NES_us", "is_top_pathway", "NES_fc")]
+  plot_data$group <- NA
+
+  if (nrow(plot_data) >= 3 * pathways_per_panel) {
+    plot_data$group[1:pathways_per_panel] <- "most unspliced"
+    plot_data$group[(nrow(plot_data) - pathways_per_panel + 1):nrow(plot_data)] <- "most spliced"
+    plot_data$group[order(abs(plot_data$NES_fc), decreasing = FALSE)[1:5]] <- "most shared"
+    plot_data <- plot_data[!is.na(plot_data$group), ]
+  } else {
+    plot_data$group <- "misc"
+    warning(paste("Factor", factor_pos, "has insufficient pathways to group — skipping."))
+    return(NULL)
+  }
+
+  # Final data formatting for plot
+  p1 <- plot_data[, c("pathway", "padj_s", "NES_s", "group", "is_top_pathway", "NES_fc")]
+  p2 <- plot_data[, c("pathway", "padj_us", "NES_us", "group", "is_top_pathway", "NES_fc")]
+  p1$mode <- "spliced"
+  p2$mode <- "unspliced"
+  colnames(p1) <- colnames(p2) <- c("pathway", "padj", "NES", "group", "is_top_pathway", "NES_fc", "mode")
+  plot_data <- rbind(p1, p2)
+
+  plot_data$mode <- factor(plot_data$mode)
+  plot_data$pathway <- sapply(as.character(plot_data$pathway), function(x) ifelse(nchar(x) > 50, paste0(substr(x, 1, 50), "..."), x))
+  plot_data$pathway <- factor(plot_data$pathway, levels = unique(plot_data$pathway))
+  plot_data$group <- factor(plot_data$group)
+
+  # Final plot
+  ggplot(subset(plot_data, !is.na(group)), aes(NES, pathway, color = mode, size = -log10(padj))) +
+    geom_point(alpha = 0.9) +
+    scale_size_continuous() +
+    theme_classic() +
+    theme(axis.text.y = element_text(size = 7)) +
+    theme(aspect.ratio = 1) +
+    facet_grid(rows = vars(group), scales = "free_y") +
+    scale_x_continuous(limits = c(0, 3), expand = c(0, 0))
+}
+
+
+# Directory to save all plots
+dir.create("gsea_velocity_plots", showWarnings = FALSE)
+
+# Loop over all factors
+skipped_factors <- c()
+
+for (i in seq_along(gsea_results)) {
+  cat("Plotting factor", i, "\n")
+  
+  tryCatch({
+    plot_i <- plot_gsea_velocity(gsea_results, factor_pos = i)
+    if (!is.null(plot_i)) {
+      plot_i <- plot_i + ggtitle(paste("Factor", i)) + theme(plot.title = element_text(hjust = 0.5))
+      ggsave(
+        filename = file.path("gsea_velocity_plots", paste0("factor_", i, "_gsea.png")),
+        plot = plot_i,
+        width = 6, height = 5.5, units = "in", dpi = 300, bg = "#ffffff"
+      )
+    } else {
+      skipped_factors <- c(skipped_factors, i)
+    }
+  }, error = function(e) {
+    cat("Skipped factor", i, "due to error:", e$message, "\n")
+    skipped_factors <- c(skipped_factors, i)
+  })
+}
+
+# View skipped
+cat("Skipped factors:", paste(skipped_factors, collapse = ", "), "\n")
+
+
+
+```
+
+
+## Fig 1
+
+```{r}
+
+load("pbmc_nmf_cv_results.RData")
+
+# label all individual cross-validation runs by group and rbind them
+p_df_sus <- p_cv_results_added
+p_df_s <- p_cv_results_spliced
+p_df_us <- p_cv_results_unspliced
+p_df_concat <- p_cv_results_concat
+
+p_df_sus$group    <- "Added"
+p_df_s$group      <- "Spliced Only"
+p_df_us$group     <- "Unspliced Only"
+p_df_concat$group <- "Concatenated"
+
+# Combine all into one dataframe
+p_df <- rbind(p_df_sus, p_df_s, p_df_us, p_df_concat)
+p_df$iter <- p_df$iter + 1
+
+# first generate a plot for Fig 1
+# Load plotting libraries
+library(ggplot2)
+library(viridis)
+
+# Set limits for y-axis
+lower_limit <- min(p_df$test_err) * 0.98
+upper_limit <- max(p_df$test_err[p_df$iter == 1])
+
+# Panel A: Test error vs. rank
+p1 <- ggplot(p_df, aes(x = k, y = test_err, color = iter, group = iter)) +
+  geom_line() +
+  scale_color_viridis_c(option = "B") +
+  theme_classic() +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Rank", color = "Epoch") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Panel B: Epoch trajectories for underfit, better fit, and overfit models
+plot_data <- subset(p_df, k == 5 | k == 30 | k == 80)
+plot_data$k <- factor(plot_data$k)
+levels(plot_data$k) <- c("Underfit (k = 5)", "Better Fit (k = 30)", "Overfit (k = 80)")
+
+p2 <- ggplot(plot_data, aes(x = iter, y = test_err, color = k, group = k)) +
+  geom_line(size = 0.5) +
+  theme_classic() +
+  scale_color_viridis_d(option = "B", end = 0.9, begin = 0.1) +
+  theme(aspect.ratio = 1) + 
+  facet_grid(cols = vars(group)) +
+  scale_y_continuous(limits = c(lower_limit, upper_limit)) + 
+  labs(y = "Test Set Loss", x = "NMF Model Epoch", color = "Rank")
+
+# Combine and save
+library(cowplot)
+final_plot <- plot_grid(p1, p2, labels = c("A", "B"), nrow = 2, align = "hv")
+ggsave("pbmc_cv_figure_with_concat.png", plot = final_plot, width = 12, height = 6.5, units = "in", bg = "#ffffff", dpi = 300)
+
+```
+
+# Heatmap
+
+```{r}
+
+load("pbmc_nmf_final_models.RData")
+library(RcppML)
+sus_nmf <- p_concat_nmf$w
+s_nmf <- p_s_nmf$w
+us_nmf <- p_us_nmf$w
+s_plus_us_nmf <- p_sus_nmf$w
+
+# combine them all!
+w <- cbind(sus_nmf[1:(nrow(sus_nmf)/2),], s_plus_us_nmf, s_nmf, us_nmf)
+modalities <- c(rep("concatenated", ncol(sus_nmf)),
+                rep("added", ncol(s_plus_us_nmf)),
+                rep("spliced", ncol(s_nmf)),
+                rep("unspliced", ncol(us_nmf)))
+
+# l2 norm on w
+
+w <- apply(w, 2, function(x) x / sqrt(sum(x^2)))
+G <- crossprod(w)
+# comparison between concatenated and unspliced needs to be modified
+G_adj <- RcppML::cosine(sus_nmf[(nrow(sus_nmf)/2 + 1): nrow(sus_nmf),], us_nmf)
+G[1:ncol(sus_nmf), (ncol(G) - ncol(us_nmf) + 1):ncol(G)] <- G_adj
+G[lower.tri(G)] <- t(G)[lower.tri(G)]
+
+# reorder based on bipartite matching against concatenated or added
+order <- c(
+  hclust(dist(t(G[,which(modalities == "concatenated")])))$order,
+  hclust(dist(t(G[,which(modalities == "added")])))$order + min(which(modalities == "added")) - 1,
+  hclust(dist(t(G[,which(modalities == "spliced")])))$order + min(which(modalities == "spliced")) - 1,
+  hclust(dist(t(G[,which(modalities == "unspliced")])))$order + min(which(modalities == "unspliced")) - 1)
+
+G <- G[order, order]
+G_ <- G
+rownames(G_) <- colnames(G_) <- 1:ncol(G_)
+colnames(G) <- rownames(G) <- modalities
+df <- reshape2::melt(G)
+df2 <- reshape2::melt(G_)
+plot_data <- data.frame("x" = df2$Var1, "y" = df2$Var2, "sim" = df2$value, "modality1" = df$Var1, "modality2" = df$Var2)
+
+p1 <- ggplot(plot_data, aes(x, y, fill = sim)) + geom_tile() + theme_classic() + scale_fill_viridis_c(option = "B", end = 0.9) + scale_y_continuous(expand = c(0.01, 0.01)) + scale_x_reverse(expand = c(0.01, 0.01)) + facet_grid(rows = vars(modality2), cols = vars(modality1), space = "free", scales = "free") + theme(axis.ticks = element_blank(), axis.text= element_blank()) + labs(fill = "Similarity", x = "NMF factors", y = "NMF factors") + theme(axis.line = element_blank())
+
+# box plot of 4-way comparison
+# y-axis per-factor cost of bipartite matching
+
+models <- list("concatenated" = sus_nmf[1:nrow(s_plus_us_nmf),], "added" = s_plus_us_nmf, "spliced" = s_nmf, "unspliced" = us_nmf)
+# concatenated model is truncated to spliced reads only
+# we will need to modify the pairing for unspliced to concatenated
+results <- list()
+for(i in 1:length(models)){
+  for(j in 1:length(models)){
+    if(i != j){
+      model1_name <- names(models)[[i]]
+      model2_name <- names(models)[[j]]
+      model1 <- apply(models[[i]], 2, function(x) x / sqrt(sum(x^2)))
+      model2 <- apply(models[[j]], 2, function(x) x / sqrt(sum(x^2)))
+      if(model1_name == "concatenated" && model2_name == "unspliced"){
+        model1 <- apply(sus_nmf[(nrow(sus_nmf)/2 + 1):nrow(sus_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      if(model2_name == "concatenated" && model1_name == "unspliced"){
+        model2 <- apply(sus_nmf[(nrow(sus_nmf)/2 + 1):nrow(sus_nmf), ], 2, function(x) x / sqrt(sum(x^2)))
+      }
+      cost <- 1 - crossprod(model1, model2)
+      if(ncol(cost) < nrow(cost)) cost <- t(cost)
+      pairs <- bipartiteMatch(cost)$pairs
+      for(k in 1:length(pairs)){
+        pairs[[k]] <- cost[k, pairs[[k]]]
+      }
+      results[[length(results) + 1]] <- data.frame("model1" = model1_name, "model2" = model2_name, "cost" = pairs)
+    }
+  }
+}
+results <- do.call(rbind, results)
+
+p2 <- ggplot(results, aes(model1, cost, color = model2)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.1), size = 1) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  labs(x = "NMF Model Modality", 
+       y = "Cost of factor bipartite matching", 
+       color = "Matched Modality") + 
+  theme(aspect.ratio = 1.5) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+p3 <- cowplot::plot_grid(p1, p2, nrow = 1, rel_widths = c(1, 0.7), labels = c("A", "B"))
+ggsave("pbmc_figure_3.png", p3, width = 12, height = 6, units = "in", bg = "#ffffff", dpi = 300)
+
+
+```
+
