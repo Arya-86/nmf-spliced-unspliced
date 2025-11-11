@@ -22,7 +22,7 @@ nmf-spliced-unspliced/
 ├── Table1_mean_sd.csv     # Summary of revealable NMF ranks (mean ± SD)
 └── README.md
 ```
-Analysis Overview
+## Analysis Overview
 
 ### **1. Cross-validation (CV) of NMF ranks**
 
@@ -64,5 +64,23 @@ ggplot(pbmc_scores, aes(...)) + geom_violin() + geom_jitter()
 ### 5. Heatmap and Additional Figures
 
 Additional figures such as pbmc_cv_figure_with_concat.png visualize comparative rank performance and modality integration.
+
+## Reproducibility
+To reproduce all figures and outputs:
+
+rmarkdown::render("code/final_code-4.Rmd")
+
+### Required R packages:
+install.packages(c("dplyr", "ggplot2", "cowplot", "Matrix", "Seurat",
+                   "fgsea", "msigdbr", "irlba", "reticulate", "dplyr", 
+                   "viridis", "RccpML"))
+remotes::install_github("zdebruine/singlet")
+
+## Data Availability
+All datasets used in this analysis are publicly available.
+Paired spliced and unspliced count matrices were obtained from:
+Gorin, G., & Chari, T. (2022). 10 scRNA-seq datasets processed using 3 unspliced counting pipelines (1.0) [Data set]. CaltechDATA. https://doi.org/10.22002/D1.20030
+
+These datasets provide processed 10x Genomics single-cell RNA-seq matrices with spliced and unspliced read annotations, used to construct modality-specific inputs for NMF analysis.
 
 
