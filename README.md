@@ -21,7 +21,7 @@ nmf-spliced-unspliced/
 ├── data/                  # Example data or rank files (optional)
 ├── Table1_mean_sd.csv     # Summary of revealable NMF ranks (mean ± SD)
 └── README.md
-
+```
 Analysis Overview
 
 ### **1. Cross-validation (CV) of NMF ranks**
