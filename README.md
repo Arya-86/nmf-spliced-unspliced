@@ -34,7 +34,7 @@ This section estimates **test reconstruction error across ranks (k)** and **repl
 - Added (s + u)
 - Concatenated (s ⊕ u)
 
-### **2. PCA Comparison
+### 2. PCA Comparison
 
 This section uses PCA to compute variance explained per component across modalities and produce scree plots.
 
@@ -55,13 +55,13 @@ Identifies enriched biological processes and contrasts spliced vs. unspliced pat
 
 Generates comparison plots for Factor 9 and Factor 28
 
-### **4. Violin Plots
+### 4. Violin Plots
 
 Shows distribution of spliced and unspliced weights per NMF factor.
 
 ggplot(pbmc_scores, aes(...)) + geom_violin() + geom_jitter()
 
-### **5. Heatmap and Additional Figures
+### 5. Heatmap and Additional Figures
 
 Additional figures such as pbmc_cv_figure_with_concat.png visualize comparative rank performance and modality integration.
 
