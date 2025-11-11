@@ -39,10 +39,10 @@ This section estimates **test reconstruction error across ranks (k)** and **repl
 This section uses PCA to compute variance explained per component across modalities and produce scree plots.
 
 Script snippet:
-
+```r
 get_pca_scree()  # Helper to compute PCA variance explained
 ggplot(...)      # Faceted scree plot by modality
-
+```
 ### 3. Gene Set Enrichment Analysis (GSEA)
 
 Performs GSEA using MSigDB C5 collections on modality-specific NMF loadings.
@@ -68,13 +68,18 @@ Additional figures such as pbmc_cv_figure_with_concat.png visualize comparative 
 ## Reproducibility
 To reproduce all figures and outputs:
 
+```r
 rmarkdown::render("code/final_code-4.Rmd")
+```
 
 ### Required R packages:
+
+```r
 install.packages(c("dplyr", "ggplot2", "cowplot", "Matrix", "Seurat",
                    "fgsea", "msigdbr", "irlba", "reticulate", "dplyr", 
                    "viridis", "RccpML"))
 remotes::install_github("zdebruine/singlet")
+```
 
 ## Data Availability
 All datasets used in this analysis are publicly available.
