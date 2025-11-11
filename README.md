@@ -10,16 +10,16 @@ All analyses were performed in **R** using the [`singlet`](https://github.com/zd
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
+
+```plaintext
 nmf-spliced-unspliced/
-├── code/ # All analysis scripts (.R / .Rmd)
-│ ├── final_code-4.Rmd # Full pipeline (CV, PCA, GSEA, violin plots)
-│ ├── utils/ # Helper functions (if any)
-│ └── ...
-├── figures/ # Output figures and plots (saved as .png / .pdf)
-├── data/ # (Optional) small test data or example rank files
-├── Table1_mean_sd.csv # Final summary of revealable ranks
+├── code/                  # R scripts and notebooks
+│   └── final_code-4.Rmd   # Full reproducible workflow (CV, PCA, GSEA, violin plots)
+├── figures/               # Output figures (PNG, PDF)
+├── data/                  # Example data or rank files (optional)
+├── Table1_mean_sd.csv     # Summary of revealable NMF ranks (mean ± SD)
 └── README.md
 
 Analysis Overview
