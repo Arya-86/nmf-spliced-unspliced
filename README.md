@@ -43,7 +43,7 @@ Script snippet:
 get_pca_scree()  # Helper to compute PCA variance explained
 ggplot(...)      # Faceted scree plot by modality
 
-### **3. Gene Set Enrichment Analysis (GSEA)
+### 3. Gene Set Enrichment Analysis (GSEA)
 
 Performs GSEA using MSigDB C5 collections on modality-specific NMF loadings.
 
