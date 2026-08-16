@@ -260,6 +260,273 @@ h_added_cv <- list(cv_results_added,cv_results_added2, cv_results_added3)
 
 ```
 
+## Prioritize a concat factor that is least represented by added factors
+
+To test whether a concat factor is truly unique (not represented at all by any added factor),
+compare each concat factor against *all* added factors and then rank concat factors by their
+best (maximum) similarity to added. Start with the concat factor whose maximum similarity is
+the **smallest**.
+
+```{r}
+# helper: cosine similarity matrix between columns of W matrices
+cosine_similarity_matrix <- function(W_concat, W_added) {
+  if (is.null(W_concat) || is.null(W_added)) {
+    stop("W_concat/W_added is NULL. If passing NMF fit objects from singlet::run_nmf, use lowercase `$w` (not `$W`).")
+  }
+  # columns are factors
+  Wc <- as.matrix(W_concat)
+  Wa <- as.matrix(W_added)
+  if (nrow(Wc) != nrow(Wa)) {
+    stop(
+      paste0(
+        "Non-conformable row dimensions: nrow(W_concat)=", nrow(Wc),
+        " vs nrow(W_added)=", nrow(Wa), ". ",
+        "Use `collapse_concat_w_to_added_space()` first so concat rows match added gene space."
+      )
+    )
+  }
+  Wc_norm <- sweep(Wc, 2, sqrt(colSums(Wc^2)), "/")
+  Wa_norm <- sweep(Wa, 2, sqrt(colSums(Wa^2)), "/")
+  t(Wc_norm) %*% Wa_norm
+}
+
+# returns concat factors ordered from least represented to most represented by added
+rank_concat_uniqueness <- function(W_concat, W_added) {
+  sim_mat <- cosine_similarity_matrix(W_concat, W_added)
+  max_sim_to_added <- apply(sim_mat, 1, max)
+  tibble(
+    concat_factor = seq_len(ncol(W_concat)),
+    max_similarity_to_added = max_sim_to_added
+  ) %>%
+    arrange(max_similarity_to_added)
+}
+
+# Collapse concat W (genes_s + genes_us rows) into added gene space by summing
+# paired rows with the same base gene name. This creates row compatibility with W_added.
+collapse_concat_w_to_added_space <- function(W_concat, suffix_pattern = "(_s|_us)$") {
+  Wc <- as.matrix(W_concat)
+  if (is.null(rownames(Wc))) {
+    stop("W_concat must have rownames so spliced/unspliced rows can be collapsed to base genes.")
+  }
+  base_gene <- sub(suffix_pattern, "", rownames(Wc))
+  rows_by_gene <- split(seq_len(nrow(Wc)), base_gene)
+  collapsed <- do.call(rbind, lapply(rows_by_gene, function(idx) {
+    if (length(idx) == 1) Wc[idx, , drop = FALSE] else matrix(colSums(Wc[idx, , drop = FALSE]), nrow = 1)
+  }))
+  rownames(collapsed) <- names(rows_by_gene)
+  colnames(collapsed) <- colnames(Wc)
+  collapsed
+}
+
+# Example usage after fitting NMF on concat and added:
+# W_concat_added_space <- collapse_concat_w_to_added_space(p_concat_nmf$w)
+# uniq_tbl <- rank_concat_uniqueness(W_concat = W_concat_added_space, W_added = p_sus_nmf$w)
+# uniq_tbl
+# recommended_start_factor <- uniq_tbl$concat_factor[1]
+# recommended_start_factor
+```
+
+```{r}
+# Optional: prioritize "non-obvious" unique concat factors by excluding
+# factors dominated by RNA splicing/processing terms.
+#
+# enrichment_tbl should include (at minimum):
+#   - concat_factor (integer factor id in concat modality)
+#   - term (pathway / GO term name)
+#   - padj (adjusted p-value; smaller = stronger enrichment)
+#
+# This still compares each concat factor against every added factor;
+# it only changes which unique concat factor you inspect first.
+prioritize_non_obvious_concat <- function(
+  W_concat,
+  W_added,
+  enrichment_tbl,
+  splicing_pattern = "(splice|splicing|snRNP|mRNA processing|RNA processing|RNA catabolic|ribonucleoprotein)"
+) {
+  if (is.null(enrichment_tbl)) {
+    stop("enrichment_tbl is NULL. Provide a data frame with columns: concat_factor, term, padj.")
+  }
+  req_cols <- c("concat_factor", "term", "padj")
+  missing_cols <- setdiff(req_cols, colnames(enrichment_tbl))
+  if (length(missing_cols) > 0) {
+    stop(paste0("enrichment_tbl is missing required columns: ", paste(missing_cols, collapse = ", ")))
+  }
+  enrichment_tbl <- enrichment_tbl %>%
+    mutate(
+      concat_factor = suppressWarnings(as.integer(concat_factor)),
+      padj = suppressWarnings(as.numeric(padj))
+    )
+  if (all(is.na(enrichment_tbl$concat_factor))) {
+    stop("`concat_factor` could not be parsed as integer. Ensure values are factor ids like 1, 2, 3, ...")
+  }
+  overlap_n <- length(intersect(seq_len(ncol(W_concat)), unique(enrichment_tbl$concat_factor)))
+  if (overlap_n == 0) {
+    stop("No overlap between concat factor ids in W_concat and enrichment_tbl$concat_factor. Check factor numbering.")
+  }
+
+  uniq_tbl <- rank_concat_uniqueness(W_concat, W_added)
+  if ("max_similarity_to_added" %in% colnames(uniq_tbl)) {
+    uniq_tbl <- uniq_tbl %>% rename(cosine_sim = max_similarity_to_added)
+  } else if (!("cosine_sim" %in% colnames(uniq_tbl))) {
+    stop("rank_concat_uniqueness output must contain `max_similarity_to_added` or `cosine_sim`.")
+  }
+  uniq_tbl <- uniq_tbl %>%
+    mutate(best_added_match = apply(cosine_similarity_matrix(W_concat, W_added), 1, which.max))
+
+  term_flags <- enrichment_tbl %>%
+    mutate(
+      is_splicing_term = str_detect(str_to_lower(term), str_to_lower(splicing_pattern))
+    ) %>%
+    group_by(concat_factor) %>%
+    summarise(
+      min_padj = suppressWarnings(min(padj, na.rm = TRUE)),
+      min_padj_splicing = suppressWarnings(min(padj[is_splicing_term], na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      min_padj = ifelse(is.infinite(min_padj), NA_real_, min_padj),
+      min_padj_splicing = ifelse(is.infinite(min_padj_splicing), NA_real_, min_padj_splicing),
+      is_splicing_dominated = !is.na(min_padj_splicing) & (is.na(min_padj) | min_padj_splicing <= min_padj * 10)
+    )
+
+  uniq_tbl %>%
+    left_join(term_flags, by = "concat_factor") %>%
+    mutate(
+      is_unique_to_concat = cosine_sim < 0.70,
+      is_non_obvious_unique = is_unique_to_concat & !coalesce(is_splicing_dominated, FALSE)
+    ) %>%
+    arrange(desc(is_non_obvious_unique), cosine_sim)
+}
+
+# Example usage:
+# Build concat_enrichment_terms directly from existing `gsea_results`
+# object produced above (one entry per concat factor, with spliced + unspliced terms).
+# This is the object to pass as `enrichment_tbl`.
+# concat_enrichment_terms <- bind_rows(lapply(seq_along(gsea_results), function(k) {
+#   bind_rows(
+#     gsea_results[[k]]$spliced %>%
+#       transmute(concat_factor = k, term = pathway, padj = padj, mode = "spliced"),
+#     gsea_results[[k]]$unspliced %>%
+#       transmute(concat_factor = k, term = pathway, padj = padj, mode = "unspliced")
+#   )
+# }))
+#
+# ranked_tbl <- prioritize_non_obvious_concat(
+#   W_concat = collapse_concat_w_to_added_space(p_concat_nmf$w),
+#   W_added = p_sus_nmf$w,
+#   enrichment_tbl = concat_enrichment_terms
+# )
+# ranked_tbl
+# suggested_non_obvious_factor <- ranked_tbl %>%
+#   filter(is_non_obvious_unique) %>%
+#   slice(1) %>%
+#   pull(concat_factor)
+# suggested_non_obvious_factor
+```
+
+```{r}
+# Hardened helper to run factor-level fgsea while keeping top_fraction fixed.
+# Adds optional diagnostics to understand why empty outputs occur.
+run_gsea_fgsea_hardened <- function(gene_weights, gene_sets, top_fraction = 0.2, min_keep = 100L, verbose = FALSE) {
+  empty_df <- data.frame(
+    pathway = character(), padj = numeric(), NES = numeric(),
+    is_top_pathway = logical(), size = integer()
+  )
+  if (is.null(names(gene_weights))) stop("gene_weights must have names")
+
+  names(gene_weights) <- sub("_(s|us)$", "", names(gene_weights))
+  gene_weights <- gene_weights[is.finite(gene_weights) & gene_weights > 0]
+  if (length(gene_weights) < 5) return(empty_df)
+
+  gene_weights <- tapply(gene_weights, names(gene_weights), max)
+  gene_weights <- setNames(as.numeric(gene_weights), names(gene_weights))
+  gene_weights <- sort(gene_weights, decreasing = TRUE)
+
+  n_keep <- max(min_keep, ceiling(length(gene_weights) * top_fraction))
+  n_keep <- min(n_keep, length(gene_weights))
+  gene_weights <- gene_weights[seq_len(n_keep)]
+
+  overlap <- sum(names(gene_weights) %in% unique(unlist(gene_sets)))
+  if (verbose) message("n_stats=", length(gene_weights), " pathway_overlap=", overlap)
+  if (length(gene_weights) < 20 || overlap < 5) return(empty_df)
+
+  fgsea_res <- fgsea::fgseaMultilevel(
+    pathways = gene_sets, stats = gene_weights,
+    minSize = 5, maxSize = 250, eps = 0, scoreType = "pos"
+  )
+  if (nrow(fgsea_res) == 0) return(empty_df)
+
+  top_pathways <- tryCatch(
+    fgsea::collapsePathways(fgsea_res, gene_sets, gene_weights, pval.threshold = 0.05, nperm = 200, gseaParam = 1)$mainPathways,
+    error = function(e) character(0)
+  )
+  data.frame(
+    pathway = fgsea_res$pathway, padj = fgsea_res$padj, NES = fgsea_res$NES,
+    is_top_pathway = fgsea_res$pathway %in% top_pathways, size = fgsea_res$size
+  )
+}
+
+# Build concat_enrichment_terms from gsea_results and fail early if empty.
+build_concat_enrichment_terms <- function(gsea_results) {
+  out <- dplyr::bind_rows(lapply(seq_along(gsea_results), function(k) {
+    dplyr::bind_rows(
+      gsea_results[[k]]$spliced %>% dplyr::transmute(concat_factor = k, term = pathway, padj = padj, mode = "spliced"),
+      gsea_results[[k]]$unspliced %>% dplyr::transmute(concat_factor = k, term = pathway, padj = padj, mode = "unspliced")
+    )
+  }))
+  if (nrow(out) == 0) stop("concat_enrichment_terms is empty. Check fgsea input size/overlap diagnostics.")
+  out
+}
+
+# Side-by-side enrichment protocol:
+# 1) Use Hallmark (H) at top_fraction = 0.2 to robustly screen non-empty signals.
+# 2) Re-run shortlisted factors with C5 for granular biology.
+run_fgsea_screen_then_refine <- function(
+  p_concat_nmf_w,
+  spliced_indices,
+  unspliced_indices,
+  top_fraction = 0.2,
+  min_keep = 100L,
+  shortlist_n = 10
+) {
+  gene_sets_h <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H") %>%
+    dplyr::select(gs_name, gene_symbol) %>%
+    split(.$gene_symbol, .$gs_name)
+
+  screen_results <- lapply(seq_len(ncol(p_concat_nmf_w)), function(i) {
+    gw_s <- p_concat_nmf_w[spliced_indices, i]; names(gw_s) <- rownames(p_concat_nmf_w)[spliced_indices]
+    gw_u <- p_concat_nmf_w[unspliced_indices, i]; names(gw_u) <- rownames(p_concat_nmf_w)[unspliced_indices]
+    list(
+      spliced = run_gsea_fgsea_hardened(gw_s, gene_sets_h, top_fraction = top_fraction, min_keep = min_keep),
+      unspliced = run_gsea_fgsea_hardened(gw_u, gene_sets_h, top_fraction = top_fraction, min_keep = min_keep)
+    )
+  })
+
+  screen_tbl <- build_concat_enrichment_terms(screen_results) %>%
+    group_by(concat_factor) %>%
+    summarise(best_padj = suppressWarnings(min(padj, na.rm = TRUE)), .groups = "drop") %>%
+    arrange(best_padj)
+
+  shortlist_factors <- head(screen_tbl$concat_factor, shortlist_n)
+
+  gene_sets_c5 <- msigdbr::msigdbr(species = "Homo sapiens", collection = "C5") %>%
+    dplyr::select(gs_name, gene_symbol) %>%
+    split(.$gene_symbol, .$gs_name)
+
+  refine_results <- lapply(shortlist_factors, function(i) {
+    gw_s <- p_concat_nmf_w[spliced_indices, i]; names(gw_s) <- rownames(p_concat_nmf_w)[spliced_indices]
+    gw_u <- p_concat_nmf_w[unspliced_indices, i]; names(gw_u) <- rownames(p_concat_nmf_w)[unspliced_indices]
+    list(
+      concat_factor = i,
+      spliced = run_gsea_fgsea_hardened(gw_s, gene_sets_c5, top_fraction = top_fraction, min_keep = min_keep),
+      unspliced = run_gsea_fgsea_hardened(gw_u, gene_sets_c5, top_fraction = top_fraction, min_keep = min_keep)
+    )
+  })
+
+  list(screen_results = screen_results, screen_table = screen_tbl, shortlist_factors = shortlist_factors, refine_results = refine_results)
+}
+```
+
 ```{r}
 # Save grouped CV data
 save(
@@ -3636,6 +3903,88 @@ ggsave("gsea_PBMC.png", plot = fig2, width = 12.5, height = 5.5, units = "in", d
 
 ```
 
+## Concat-only candidate summary figure (example: Factor 34)
+```{r}
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+
+# requires: ranked_tbl, p_concat_nmf, p_sus_nmf, gsea_results
+target_factor <- 34
+top_n_genes <- 30
+
+# identify best added match from ranking table
+best_added <- ranked_tbl %>%
+  filter(concat_factor == target_factor) %>%
+  pull(best_added_match) %>%
+  .[1]
+
+# collapse concat W to added-gene space
+W_concat_added_space <- collapse_concat_w_to_added_space(p_concat_nmf$w)
+
+# top genes for concat factor and its best added match
+concat_vec <- W_concat_added_space[, target_factor]
+added_vec  <- p_sus_nmf$w[, best_added]
+
+top_concat <- sort(concat_vec, decreasing = TRUE)[1:min(top_n_genes, length(concat_vec))]
+top_added  <- sort(added_vec,  decreasing = TRUE)[1:min(top_n_genes, length(added_vec))]
+
+top_overlap <- intersect(names(top_concat), names(top_added))
+jaccard_top <- length(top_overlap) / length(unique(c(names(top_concat), names(top_added))))
+
+# panel A: summary metrics
+summary_df <- ranked_tbl %>%
+  filter(concat_factor == target_factor) %>%
+  mutate(
+    jaccard_top_genes = jaccard_top,
+    top_overlap_count = length(top_overlap),
+    label = paste0(
+      "Concat factor: ", concat_factor,
+      "\nBest added match: ", best_added_match,
+      "\nCosine similarity: ", signif(cosine_sim, 4),
+      "\nTop-", top_n_genes, " Jaccard: ", signif(jaccard_top_genes, 3),
+      "\nTop-", top_n_genes, " overlap count: ", top_overlap_count,
+      "\nTop term: ", top_term
+    )
+  )
+
+pA <- ggplot(summary_df, aes(x = 1, y = 1, label = label)) +
+  geom_text(hjust = 0, vjust = 1, size = 4) +
+  xlim(1, 2.5) + ylim(0, 1.2) +
+  labs(title = "A. Concat-only candidate summary") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"))
+
+# panel B: top spliced pathways
+path_s <- gsea_results[[target_factor]]$spliced %>%
+  arrange(padj) %>%
+  mutate(pathway = gsub("^GO(BP|CC|MF)_", "", pathway)) %>%
+  slice_head(n = 10)
+
+pB <- ggplot(path_s, aes(x = reorder(pathway, -log10(padj)), y = -log10(padj))) +
+  geom_col(fill = "#2C7BB6") +
+  coord_flip() +
+  labs(title = "B. Spliced enrichment (Factor 34)", x = NULL, y = "-log10(padj)") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold"), axis.text.y = element_text(size = 8))
+
+# panel C: top unspliced pathways
+path_us <- gsea_results[[target_factor]]$unspliced %>%
+  arrange(padj) %>%
+  mutate(pathway = gsub("^GO(BP|CC|MF)_", "", pathway)) %>%
+  slice_head(n = 10)
+
+pC <- ggplot(path_us, aes(x = reorder(pathway, -log10(padj)), y = -log10(padj))) +
+  geom_col(fill = "#D7191C") +
+  coord_flip() +
+  labs(title = "C. Unspliced enrichment (Factor 34)", x = NULL, y = "-log10(padj)") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold"), axis.text.y = element_text(size = 8))
+
+factor34_fig <- plot_grid(pA, pB, pC, ncol = 3, rel_widths = c(1, 1.4, 1.4))
+ggsave("pbmc_factor34_concat_only_summary.png", factor34_fig, width = 16, height = 5, units = "in", dpi = 300, bg = "#ffffff")
+```
+
 ## Violin Plot
 
 ```{r}
@@ -4330,4 +4679,3 @@ write.csv(df_iter50_superwide,
 
 
 ```
-
