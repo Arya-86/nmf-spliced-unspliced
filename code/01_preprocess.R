@@ -1,3 +1,19 @@
+
+read_npz_into_R <- function(file_path) {
+  np <- reticulate::import("numpy")
+  npz_data <- np$load(file_path)
+
+  r_data <- new(
+    "dgRMatrix",
+    x   = as.numeric(npz_data[["data"]]),
+    j   = as.integer(npz_data[["indices"]]),
+    p   = as.integer(npz_data[["indptr"]]),
+    Dim = as.integer(npz_data[["shape"]])
+  )
+
+  as(r_data, "CsparseMatrix")
+}
+
 prepare_dataset <- function(
     data_dir,
     dataset_prefix,
@@ -45,15 +61,14 @@ prepare_dataset <- function(
   combined_counts <- spliced_counts + unspliced_counts
 
   keep_cells <- which(
-    colSums(combined_counts != 0) > min_features &
-    colSums(combined_counts != 0) < max_features &
-    colSums(combined_counts) > min_umis &
-    colSums(combined_counts) < max_umis
+  Matrix::colSums(combined_counts != 0) > min_features &
+  Matrix::colSums(combined_counts != 0) < max_features &
+  Matrix::colSums(combined_counts) > min_umis &
+  Matrix::colSums(combined_counts) < max_umis
   )
 
-  combined_counts <- combined_counts[, keep_cells]
+  combined_counts <- combined_counts[, keep_cells, drop = FALSE]
 
-  # Normalize exactly as in the original pipeline
   added <- Seurat::LogNormalize(combined_counts)
 
   # Remove duplicated gene names AFTER normalization,
@@ -61,7 +76,7 @@ prepare_dataset <- function(
   num_dups <- sum(duplicated(rownames(added)))
 
   added <- added[
-    !duplicated(rownames(added)),
+    !duplicated(rownames(added)), drop = FALSE
   ]
 
   stopifnot(
@@ -88,8 +103,8 @@ prepare_dataset <- function(
     paste0(gene_names, "_us")
 
   concat <- rbind(
-    spliced_counts[, keep_cells],
-    unspliced_counts[, keep_cells]
+    spliced_counts[, keep_cells, drop = FALSE],
+    unspliced_counts[, keep_cells, drop = FALSE]
   )
 
   spliced_indices <- seq_len(nrow(spliced_counts))
@@ -97,7 +112,7 @@ prepare_dataset <- function(
   unspliced_indices <-
     (nrow(spliced_counts) + 1):nrow(concat)
 
-  # Normalize exactly as in the original pipeline
+ 
   concat <- Seurat::LogNormalize(concat)
 
 
