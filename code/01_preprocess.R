@@ -93,11 +93,14 @@ prepare_dataset <- function(
   num_dups <- sum(duplicated(rownames(added)))
 
   added <- added[
-    !duplicated(rownames(added)), drop = FALSE
+    !duplicated(rownames(added)), 
+    ,
+    drop = FALSE
   ]
 
   stopifnot(
-    length(unique(rownames(added))) == nrow(added)
+    length(unique(rownames(added))) == 
+      nrow(added)
   )
 
   message(
