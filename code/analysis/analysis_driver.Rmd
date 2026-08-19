@@ -1,0 +1,493 @@
+---
+title: "Joint Representation of Spliced and Unspliced RNA: Analysis Driver"
+author: "Arya Jadhav and Zachary J. DeBruine"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+# Overview
+
+This notebook provides a reusable analysis workflow for the spliced,
+unspliced, added, and concatenated single-cell RNA representations used in
+the manuscript.
+
+To analyze a different dataset, update the dataset configuration below.
+The analysis functions themselves are defined in the `code/` directory.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(Matrix)
+library(Seurat)
+library(singlet)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(cowplot)
+library(fgsea)
+library(msigdbr)
+
+source("../code/01_preprocess.R")
+source("../code/02_cross_validation.R")
+source("../code/03_fit_models.R")
+source("../code/04_factor_matching.R")
+source("../code/05_gsea.R")
+source("../code/06_pca.R")
+source("../code/07_figures.R")
+source("../code/08_factor_similarity.R")
+source("../code/09_modality_loadings.R")
+source("../code/10_umap.R")
+```
+
+# Dataset configuration
+
+Change these values to run the workflow on another dataset.
+
+```{r configuration}
+dataset_name <- "heart"
+
+data_dir <- "../data/heart_10k_v3_cr_extracted"
+
+dataset_prefix <- "heart_10k_v3_cr"
+
+species <- "Mus musculus"
+
+output_dir <- file.path(
+  "../results",
+  dataset_name
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+# Preprocessing
+
+Read the spliced and unspliced matrices, apply cell-level quality control,
+construct the added and concatenated representations, and normalize the
+resulting matrices.
+
+```{r preprocessing}
+dataset <- prepare_dataset(
+  data_dir = data_dir,
+  dataset_prefix = dataset_prefix
+)
+
+dataset
+```
+
+# Cross-validation
+
+NMF rank is evaluated over ranks 2 through 80.
+
+The `get_best_rank()` result is used as the operational rank for fitting
+the downstream NMF models in this workflow. These operational ranks are
+distinct from the manually selected revealable-rank values summarized
+across replicate cross-validation runs in the manuscript tables.
+
+```{r cross-validation}
+set.seed(43)
+
+cv_results <- list(
+
+  spliced = cross_val(
+    dataset$concat[
+      dataset$spliced_indices,
+      ,
+      drop = FALSE
+    ],
+    ranks = 2:80,
+    n_replicates = 3
+  ),
+
+  unspliced = cross_val(
+    dataset$concat[
+      dataset$unspliced_indices,
+      ,
+      drop = FALSE
+    ],
+    ranks = 2:80,
+    n_replicates = 3
+  ),
+
+  added = cross_val(
+    dataset$added,
+    ranks = 2:80,
+    n_replicates = 3
+  ),
+
+  concat = cross_val(
+    dataset$concat,
+    ranks = 2:80,
+    n_replicates = 3
+  )
+)
+```
+
+# Operational NMF ranks
+
+```{r operational-ranks}
+ranks <- c(
+
+  spliced = get_best_rank(
+    cv_results$spliced
+  ),
+
+  unspliced = get_best_rank(
+    cv_results$unspliced
+  ),
+
+  added = get_best_rank(
+    cv_results$added
+  ),
+
+  concat = get_best_rank(
+    cv_results$concat
+  )
+)
+
+ranks
+```
+
+# Fit final NMF models
+
+```{r fit-models}
+models <- fit_nmf_models(
+  dataset = dataset,
+  ranks = ranks,
+  seed = 123
+)
+```
+
+# Cross-validation visualization
+
+The plotting function uses the test-error trajectories generated during
+cross-validation.
+
+```{r cv-figure}
+cv_plot_data <- bind_rows(
+
+  cv_results$spliced %>%
+    mutate(
+      group = "Spliced Only"
+    ),
+
+  cv_results$unspliced %>%
+    mutate(
+      group = "Unspliced Only"
+    ),
+
+  cv_results$added %>%
+    mutate(
+      group = "Added"
+    ),
+
+  cv_results$concat %>%
+    mutate(
+      group = "Concatenated"
+    )
+)
+
+# plot_cv() expects the original plotting-column name
+if (
+  "test_error" %in% names(cv_plot_data) &&
+  !"test_err" %in% names(cv_plot_data)
+) {
+  cv_plot_data$test_err <-
+    cv_plot_data$test_error
+}
+
+cv_figure <- plot_cv(
+  cv_plot_data
+)
+
+cv_figure
+```
+
+# PCA scree analysis
+
+```{r pca}
+pca_results <- bind_rows(
+
+  get_pca_scree(
+    dataset$concat[
+      dataset$spliced_indices,
+      ,
+      drop = FALSE
+    ],
+    label = "Spliced"
+  ),
+
+  get_pca_scree(
+    dataset$concat[
+      dataset$unspliced_indices,
+      ,
+      drop = FALSE
+    ],
+    label = "Unspliced"
+  ),
+
+  get_pca_scree(
+    dataset$added,
+    label = "Added"
+  ),
+
+  get_pca_scree(
+    dataset$concat,
+    label = "Concatenated"
+  )
+)
+
+pca_figure <- plot_pca_scree(
+  pca_results
+)
+
+pca_figure
+```
+
+# Factor similarity and matching
+
+Compare NMF factors across the four representations using cosine
+similarity and optimal bipartite matching.
+
+```{r factor-similarity}
+factor_similarity <- factor_similarity_analysis(
+  models
+)
+
+factor_similarity$figure
+```
+
+# Gene-set collection
+
+Construct the MSigDB C5 gene-set collection appropriate for the current
+dataset.
+
+```{r gene-sets}
+gene_sets <- msigdbr(
+  species = species,
+  collection = "C5"
+) %>%
+  dplyr::select(
+    gs_name,
+    gene_symbol
+  ) %>%
+  dplyr::distinct() %>%
+  dplyr::group_by(
+    gs_name
+  ) %>%
+  dplyr::summarise(
+    genes = list(gene_symbol),
+    .groups = "drop"
+  ) %>%
+  tibble::deframe()
+```
+
+# Modality loading balance and GSEA
+
+For each concatenated NMF factor, calculate the relative contribution of
+spliced and unspliced feature weights and compare enrichment obtained
+from the two modality-specific loading vectors.
+
+```{r modality-gsea}
+modality_gsea <- plot_modality_balance_gsea(
+  concat_nmf = models$concat,
+  gene_sets = gene_sets
+)
+
+modality_gsea$figure
+```
+
+# UMAP comparison
+
+Generate separate UMAP embeddings from the NMF cell-factor matrices for
+the four representations. Cluster labels are defined using the Added
+representation and transferred to all four embeddings for comparison.
+
+```{r umap}
+umap_results <- compare_nmf_umaps(
+  dataset = dataset,
+  models = models
+)
+
+umap_results$figure
+```
+
+# Manuscript-specific analyses
+
+Some manuscript figures use selected datasets or selected NMF factors and
+are therefore not general steps in the analysis pipeline.
+
+## PBMC selected-factor loading comparison
+
+The factors below correspond to the selected concatenated PBMC factors
+shown in Figure 4.
+
+```{r pbmc-selected-factors}
+if (tolower(dataset_name) == "pbmc") {
+
+  selected_loadings <- plot_selected_modality_loadings(
+    concat_nmf = models$concat,
+    spliced_dominant = c(34, 35),
+    unspliced_dominant = c(23, 28),
+    n_label = 7
+  )
+
+  print(
+    selected_loadings$figure
+  )
+}
+```
+
+# Save analysis results
+
+```{r save-results}
+saveRDS(
+  ranks,
+  file.path(
+    output_dir,
+    "operational_ranks.rds"
+  )
+)
+
+saveRDS(
+  cv_results,
+  file.path(
+    output_dir,
+    "cross_validation.rds"
+  )
+)
+
+saveRDS(
+  models,
+  file.path(
+    output_dir,
+    "nmf_models.rds"
+  )
+)
+
+saveRDS(
+  pca_results,
+  file.path(
+    output_dir,
+    "pca_results.rds"
+  )
+)
+
+saveRDS(
+  factor_similarity$matching_results,
+  file.path(
+    output_dir,
+    "factor_matching_results.rds"
+  )
+)
+
+saveRDS(
+  modality_gsea$modality_scores,
+  file.path(
+    output_dir,
+    "modality_loading_scores.rds"
+  )
+)
+
+saveRDS(
+  modality_gsea$gsea_results,
+  file.path(
+    output_dir,
+    "concat_gsea_results.rds"
+  )
+)
+
+saveRDS(
+  umap_results$plot_data,
+  file.path(
+    output_dir,
+    "umap_results.rds"
+  )
+)
+```
+
+# Save figures
+
+```{r save-figures}
+ggsave(
+  file.path(
+    output_dir,
+    "cross_validation.pdf"
+  ),
+  cv_figure,
+  width = 12,
+  height = 6.5
+)
+
+ggsave(
+  file.path(
+    output_dir,
+    "pca_scree.pdf"
+  ),
+  pca_figure,
+  width = 8,
+  height = 6
+)
+
+ggsave(
+  file.path(
+    output_dir,
+    "factor_similarity.pdf"
+  ),
+  factor_similarity$figure,
+  width = 12,
+  height = 6
+)
+
+ggsave(
+  file.path(
+    output_dir,
+    "modality_balance_gsea.pdf"
+  ),
+  modality_gsea$figure,
+  width = 11,
+  height = 5
+)
+
+ggsave(
+  file.path(
+    output_dir,
+    "umap_comparison.pdf"
+  ),
+  umap_results$figure,
+  width = 8,
+  height = 7
+)
+
+if (
+  tolower(dataset_name) == "pbmc" &&
+  exists("selected_loadings")
+) {
+
+  ggsave(
+    file.path(
+      output_dir,
+      "selected_factor_loadings.pdf"
+    ),
+    selected_loadings$figure,
+    width = 7,
+    height = 7
+  )
+}
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
