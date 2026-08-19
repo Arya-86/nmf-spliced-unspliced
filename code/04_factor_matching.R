@@ -79,3 +79,52 @@ match_added_to_concat <- function(added_w, concat_w) {
     )
   )
 }
+
+
+get_concat_block <- function(
+    concat_w,
+    modality = c(
+      "spliced",
+      "unspliced"
+    )
+) {
+
+  modality <- match.arg(
+    modality
+  )
+
+  suffix <- if (
+    modality == "spliced"
+  ) {
+    "_s$"
+  } else {
+    "_us$"
+  }
+
+  row_idx <- grep(
+    suffix,
+    rownames(concat_w)
+  )
+
+  if (length(row_idx) == 0) {
+    stop(
+      "No ",
+      modality,
+      " features found in concatenated loading matrix."
+    )
+  }
+
+  block <- concat_w[
+    row_idx,
+    ,
+    drop = FALSE
+  ]
+
+  rownames(block) <- sub(
+    suffix,
+    "",
+    rownames(block)
+  )
+
+  block
+}
