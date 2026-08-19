@@ -194,17 +194,17 @@ cv_plot_data <- bind_rows(
   cv_results$concat %>%
     mutate(
       group = "Concatenated"
-    )
-)
-
-# plot_cv() expects the original plotting-column name
-if (
-  "test_error" %in% names(cv_plot_data) &&
-  !"test_err" %in% names(cv_plot_data)
-) {
-  cv_plot_data$test_err <-
-    cv_plot_data$test_error
-}
+    ) 
+) %>%
+  group_by(
+    group,
+    k,
+    iter
+  ) %>%
+  summarise(
+    test_err = mean(test_error),
+    .groups = "drop"
+  )
 
 cv_figure <- plot_cv(
   cv_plot_data
