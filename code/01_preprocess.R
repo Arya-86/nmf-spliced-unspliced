@@ -1,4 +1,21 @@
 
+# ============================================================
+# 01_preprocess.R
+#
+# Preprocessing used in Jadhav & DeBruine (2026)
+#
+# IMPORTANT:
+# This script preserves the preprocessing order used in the
+# original manuscript analysis. In particular, duplicate gene
+# symbols are removed from the Added representation after
+# normalization but are not removed from the Concatenated
+# representation before NMF.
+# ============================================================
+
+library(Matrix)
+library(Seurat)
+library(reticulate)
+
 read_npz_into_R <- function(file_path) {
   np <- reticulate::import("numpy")
   npz_data <- np$load(file_path)
