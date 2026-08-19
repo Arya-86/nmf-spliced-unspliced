@@ -1,12 +1,12 @@
 # ============================================================
 # 07_figures.R
 #
-# Plotting functions used for manuscript figures.
+# Reusable plotting functions for manuscript figures.
 # ============================================================
 
 library(ggplot2)
-library(viridis)
 library(cowplot)
+library(viridis)
 
 
 # ------------------------------------------------------------
@@ -23,8 +23,14 @@ plot_pca_scree <- function(scree_df) {
       color = Modality
     )
   ) +
-    geom_line(linewidth = 0.8, alpha = 0.9) +
-    geom_point(size = 1.5, alpha = 0.9) +
+    geom_line(
+      linewidth = 0.8,
+      alpha = 0.9
+    ) +
+    geom_point(
+      size = 1.5,
+      alpha = 0.9
+    ) +
     scale_x_continuous(
       breaks = seq(0, 50, 10)
     ) +
@@ -52,9 +58,15 @@ plot_pca_scree <- function(scree_df) {
 
 plot_cv <- function(df) {
 
-  lower_limit <- min(df$test_err)
-  upper_limit <- max(df$test_err[df$iter == min(df$iter)])
+  # Original CV output uses zero-based iteration numbering
+  df$iter <- df$iter + 1
 
+  lower_limit <- min(df$test_err) * 0.98
+  upper_limit <- max(
+    df$test_err[df$iter == 1]
+  )
+
+  # Panel A: test error across rank and epoch
   p1 <- ggplot(
     df,
     aes(
@@ -65,32 +77,42 @@ plot_cv <- function(df) {
     )
   ) +
     geom_line() +
-    scale_color_viridis_c(option = "B") +
-    facet_grid(cols = vars(group)) +
-    scale_y_continuous(
-      limits = c(lower_limit, upper_limit)
-    ) +
-    labs(
-      x = "NMF Model Rank",
-      y = "Test Set Loss",
-      color = "Epoch"
+    scale_color_viridis_c(
+      option = "B"
     ) +
     theme_classic() +
-    theme(aspect.ratio = 1)
+    theme(
+      aspect.ratio = 1
+    ) +
+    facet_grid(
+      cols = vars(group)
+    ) +
+    scale_y_continuous(
+      limits = c(
+        lower_limit,
+        upper_limit
+      )
+    ) +
+    labs(
+      y = "Test Set Loss",
+      x = "NMF Model Rank",
+      color = "Epoch"
+    )
 
+  # Panel B: representative rank trajectories
   plot_data <- subset(
     df,
-    k %in% c(5, 30, 80)
+    k == 5 | k == 30 | k == 80
   )
 
   plot_data$k <- factor(
-    plot_data$k,
-    levels = c(5, 30, 80),
-    labels = c(
-      "Underfit (k = 5)",
-      "Better Fit (k = 30)",
-      "Overfit (k = 80)"
-    )
+    plot_data$k
+  )
+
+  levels(plot_data$k) <- c(
+    "Underfit (k = 5)",
+    "Better Fit (k = 30)",
+    "Overfit (k = 80)"
   )
 
   p2 <- ggplot(
@@ -102,23 +124,32 @@ plot_cv <- function(df) {
       group = k
     )
   ) +
-    geom_line(linewidth = 0.5) +
+    geom_line(
+      size = 0.5
+    ) +
+    theme_classic() +
     scale_color_viridis_d(
       option = "B",
       end = 0.9,
       begin = 0.1
     ) +
-    facet_grid(cols = vars(group)) +
+    theme(
+      aspect.ratio = 1
+    ) +
+    facet_grid(
+      cols = vars(group)
+    ) +
     scale_y_continuous(
-      limits = c(lower_limit, upper_limit)
+      limits = c(
+        lower_limit,
+        upper_limit
+      )
     ) +
     labs(
-      x = "NMF Model Epoch",
       y = "Test Set Loss",
+      x = "NMF Model Epoch",
       color = "Rank"
-    ) +
-    theme_classic() +
-    theme(aspect.ratio = 1)
+    )
 
   cowplot::plot_grid(
     p1,
@@ -131,7 +162,7 @@ plot_cv <- function(df) {
 
 
 # ------------------------------------------------------------
-# GSEA comparison for spliced and unspliced loadings
+# GSEA comparison within a concatenated factor
 # ------------------------------------------------------------
 
 plot_gsea_velocity <- function(
@@ -142,6 +173,18 @@ plot_gsea_velocity <- function(
 
   gsea_s <- gsea_results[[factor_pos]]$spliced
   gsea_us <- gsea_results[[factor_pos]]$unspliced
+
+  if (
+    nrow(gsea_s) == 0 &&
+    nrow(gsea_us) == 0
+  ) {
+    stop(
+      paste(
+        "No GSEA results found for factor",
+        factor_pos
+      )
+    )
+  }
 
   rownames(gsea_s) <- gsea_s$pathway
   rownames(gsea_us) <- gsea_us$pathway
@@ -164,25 +207,54 @@ plot_gsea_velocity <- function(
     NES_us = plot_data$NES.y
   )
 
-  plot_data$padj_s[is.na(plot_data$padj_s)] <- 1
-  plot_data$padj_us[is.na(plot_data$padj_us)] <- 1
-  plot_data$NES_s[is.na(plot_data$NES_s)] <- 0
-  plot_data$NES_us[is.na(plot_data$NES_us)] <- 0
+  plot_data$padj_s[
+    is.na(plot_data$padj_s)
+  ] <- 1
+
+  plot_data$padj_us[
+    is.na(plot_data$padj_us)
+  ] <- 1
+
+  plot_data$NES_s[
+    is.na(plot_data$NES_s)
+  ] <- 0
+
+  plot_data$NES_us[
+    is.na(plot_data$NES_us)
+  ] <- 0
 
   plot_data <- subset(
     plot_data,
-    padj_s < 0.05 | padj_us < 0.05
+    padj_s < 0.05 |
+      padj_us < 0.05
   )
 
   plot_data <- plot_data[
-    grep("GOBP_", plot_data$pathway),
+    grep(
+      "GOBP_",
+      plot_data$pathway
+    ),
     ,
     drop = FALSE
   ]
 
+  if (
+    nrow(plot_data) <
+      3 * pathways_per_panel
+  ) {
+    stop(
+      paste(
+        "Too few significant GOBP pathways for factor",
+        factor_pos
+      )
+    )
+  }
+
   fold_change <- function(x, y) {
+
     denom <- x + y
     denom[denom == 0] <- NA
+
     ifelse(
       x > y,
       (x - y) / denom,
@@ -202,33 +274,55 @@ plot_gsea_velocity <- function(
   )
 
   n <- nrow(plot_data)
+
   ord_fc <- order(
     plot_data$NES_fc,
     decreasing = TRUE
   )
 
-  idx_unspliced <- ord_fc[
-    seq_len(pathways_per_panel)
-  ]
+  idx_most_unspliced <-
+    ord_fc[
+      1:pathways_per_panel
+    ]
 
-  idx_spliced <- ord_fc[
-    (n - pathways_per_panel + 1):n
-  ]
+  idx_most_spliced <-
+    ord_fc[
+      (n - pathways_per_panel + 1):n
+    ]
 
   remaining <- setdiff(
     seq_len(n),
-    c(idx_unspliced, idx_spliced)
+    c(
+      idx_most_unspliced,
+      idx_most_spliced
+    )
   )
 
-  idx_shared <- remaining[
-    order(abs(plot_data$NES_fc[remaining]))
-  ][seq_len(pathways_per_panel)]
+  idx_most_shared <-
+    remaining[
+      order(
+        abs(
+          plot_data$NES_fc[
+            remaining
+          ]
+        ),
+        decreasing = FALSE
+      )
+    ][1:pathways_per_panel]
 
   plot_data$group <- NA_character_
 
-  plot_data$group[idx_unspliced] <- "most unspliced"
-  plot_data$group[idx_spliced] <- "most spliced"
-  plot_data$group[idx_shared] <- "most shared"
+  plot_data$group[
+    idx_most_unspliced
+  ] <- "most unspliced"
+
+  plot_data$group[
+    idx_most_spliced
+  ] <- "most spliced"
+
+  plot_data$group[
+    idx_most_shared
+  ] <- "most shared"
 
   plot_data <- plot_data[
     !is.na(plot_data$group),
@@ -238,12 +332,22 @@ plot_gsea_velocity <- function(
 
   p1 <- plot_data[
     ,
-    c("pathway", "padj_s", "NES_s", "group")
+    c(
+      "pathway",
+      "padj_s",
+      "NES_s",
+      "group"
+    )
   ]
 
   p2 <- plot_data[
     ,
-    c("pathway", "padj_us", "NES_us", "group")
+    c(
+      "pathway",
+      "padj_us",
+      "NES_us",
+      "group"
+    )
   ]
 
   p1$mode <- "spliced"
@@ -251,11 +355,40 @@ plot_gsea_velocity <- function(
 
   colnames(p1) <-
     colnames(p2) <-
-    c("pathway", "padj", "NES", "group", "mode")
+    c(
+      "pathway",
+      "padj",
+      "NES",
+      "group",
+      "mode"
+    )
 
   plot_data_long <- rbind(
     p1,
     p2
+  )
+
+  plot_data_long$pathway <- sapply(
+    as.character(
+      plot_data_long$pathway
+    ),
+    function(x) {
+      ifelse(
+        nchar(x) > 50,
+        paste0(
+          substr(x, 1, 50),
+          "..."
+        ),
+        x
+      )
+    }
+  )
+
+  plot_data_long$pathway <- factor(
+    plot_data_long$pathway,
+    levels = unique(
+      plot_data_long$pathway
+    )
   )
 
   plot_data_long$group <- factor(
@@ -276,7 +409,9 @@ plot_gsea_velocity <- function(
       size = -log10(padj)
     )
   ) +
-    geom_point(alpha = 0.9) +
+    geom_point(
+      alpha = 0.9
+    ) +
     facet_grid(
       rows = vars(group),
       scales = "free_y",
@@ -286,14 +421,19 @@ plot_gsea_velocity <- function(
       limits = c(0, 3),
       expand = c(0, 0)
     ) +
-    theme_classic(base_size = 11) +
+    theme_classic(
+      base_size = 11
+    ) +
     theme(
-      axis.text.y = element_text(size = 7)
+      axis.text.y =
+        element_text(size = 7)
     ) +
     labs(
       x = "NES",
       y = NULL,
       color = "mode",
-      size = expression(-log[10](padj))
+      size = expression(
+        -log[10](padj)
+      )
     )
 }
